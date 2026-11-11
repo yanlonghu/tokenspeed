@@ -990,6 +990,7 @@ class Plane:
         self.held = None
         self.unblock = threading.Event()
         self.failing = False
+        self.completion_failing = False
         self.cumulative_probs = None
 
     def note(self, name):
@@ -1016,6 +1017,8 @@ class Plane:
 
     def complete(self, launched):
         self.note("complete")
+        if self.completion_failing:
+            raise RuntimeError("the completion failed")
         return ([launched], [1], None, None, None, None, None, None, self.cumulative_probs)
 
     def note_committed(self, launched):
@@ -1226,5 +1229,29 @@ result = (Plane(), ts.Scheduler(cfg))
         // Every later call reports the failure, on either thread's side.
         assert!(data_plane.poll_cache_events().is_err());
         assert!(data_plane.release(&["r".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn a_failed_completion_notifies_the_launcher_before_logging() {
+        crate::tests::assert_launcher_notified_before_blocking(
+            "data_plane::tests::a_failed_completion_notifies_the_launcher_before_logging",
+            || {
+                let (plane, mut scheduler) = plane();
+                Python::attach(|py| plane.setattr(py, "completion_failing", true).unwrap());
+                let batch = batch();
+                let dispatch = Dispatch {
+                    forward: Some(&batch),
+                    ..Dispatch::default()
+                };
+                LAUNCHER_FAILURE.get_or_init(crate::LauncherFailure::for_parent);
+                let mut data_plane = PythonDataPlane::start(plane, None).unwrap();
+                let forward = data_plane
+                    .execute(scheduler.next_execution_plan(true, false), &dispatch)
+                    .unwrap()
+                    .unwrap();
+                let error = data_plane.complete(forward).unwrap_err();
+                assert!(error.0.contains("the completion failed"), "{}", error.0);
+            },
+        );
     }
 }
