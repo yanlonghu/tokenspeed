@@ -914,40 +914,56 @@ mod tests {
 
     #[test]
     fn serving_error_notifies_launcher_before_teardown() {
+        assert_launcher_notified_before_blocking(
+            "tests::serving_error_notifies_launcher_before_teardown",
+            || {
+                let launcher = LauncherFailure::for_parent();
+                let result = finish_serving(
+                    Err(LoopError::Scheduler("serving failed".to_owned())),
+                    &launcher,
+                    || {
+                        wait_for_launcher();
+                        Err(HostError::Python("close failed".to_owned()))
+                    },
+                );
+                assert!(
+                    matches!(result, Err(HostError::Loop(LoopError::Scheduler(message)))
+                    if message == "serving failed")
+                );
+            },
+        );
+    }
+
+    fn wait_for_launcher() {
+        // The launcher holds this pipe open until it gets SIGUSR1.
+        std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink()).unwrap();
+    }
+
+    pub(super) fn assert_launcher_notified_before_blocking(test: &str, child: impl FnOnce()) {
         use std::{
             process::{Command, Stdio},
+            sync::Mutex,
             time::Duration,
         };
         use tokio::signal::unix::{signal, SignalKind};
 
-        const CHILD: &str = "TS_HOST_BLOCKED_TEARDOWN_TEST";
-        if std::env::var_os(CHILD).is_some() {
-            // The launcher holds this pipe open until it gets SIGUSR1.
-            let wait_for_launcher = || {
-                std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink()).unwrap();
-            };
+        const CHILD: &str = "TS_HOST_SIGNAL_TEST_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok(test) {
             tracing_subscriber::fmt()
-                .with_writer(move || {
+                .with_writer(|| {
                     wait_for_launcher();
                     std::io::sink()
                 })
                 .init();
-            let launcher = LauncherFailure::for_parent();
-            let result = finish_serving(
-                Err(LoopError::Scheduler("serving failed".to_owned())),
-                &launcher,
-                || {
-                    wait_for_launcher();
-                    Err(HostError::Python("close failed".to_owned()))
-                },
-            );
-            assert!(
-                matches!(result, Err(HostError::Loop(LoopError::Scheduler(message)))
-                if message == "serving failed")
-            );
+            child();
             return;
         }
 
+        // The tests share a process, so only one may listen for SIGUSR1 at a time.
+        static SIGNAL_TEST: Mutex<()> = Mutex::new(());
+        let _signal_test = SIGNAL_TEST
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -957,11 +973,8 @@ mod tests {
             signal(SignalKind::user_defined1()).unwrap()
         };
         let mut rank = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "tests::serving_error_notifies_launcher_before_teardown",
-            ])
-            .env(CHILD, "1")
+            .args(["--exact", test])
+            .env(CHILD, test)
             .stdin(Stdio::piped())
             .spawn()
             .unwrap();
@@ -976,7 +989,7 @@ mod tests {
         assert!(rank.wait().unwrap().success());
         assert!(
             notified && running,
-            "no launcher signal before blocked logging and teardown"
+            "no launcher signal while the child was alive and the pipe was held open"
         );
     }
 
