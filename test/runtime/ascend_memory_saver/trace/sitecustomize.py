@@ -73,7 +73,7 @@ def trace_transition(name, method):
         result = method(adapter, tag)
         elapsed = time.monotonic() - started
         record(name, tag=tag, before=before, after=adapter.stats(), seconds=elapsed)
-        if name == "resume" and tag == "cuda_graph":
+        if name == "resume" and tag == "acl_graph":
             PHASE = "after"
         return result
 

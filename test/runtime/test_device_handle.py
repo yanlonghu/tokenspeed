@@ -1549,6 +1549,42 @@ def test_kv_release_without_a_peer_only_quiesces_and_repairs():
     ]
 
 
+@pytest.mark.parametrize("operation", ["plan_without_forward", "idle_forward"])
+def test_ascend_saver_refuses_to_launch_with_unavailable_pools(operation):
+    from tokenspeed.runtime.execution.ascend_memory_saver_device import (
+        AscendMemorySaverDeviceHandle,
+    )
+
+    executor = _SleepExecutor([])
+    executor.model_runner = SimpleNamespace(
+        memory_saver_adapter=SimpleNamespace(
+            assert_active=mock.Mock(side_effect=RuntimeError("pool unavailable"))
+        )
+    )
+    handle = AscendMemorySaverDeviceHandle(executor)
+
+    with pytest.raises(RuntimeError, match="pool unavailable"):
+        if operation == "plan_without_forward":
+            handle.execute(None, None, cache_ops=())
+        else:
+            handle.run_idle_forward(None)
+
+
+def test_ascend_saver_finishes_kv_zeroing_before_registration():
+    from tokenspeed.runtime.execution.ascend_memory_saver_device import (
+        AscendMemorySaverDeviceHandle,
+    )
+
+    trace = []
+    handle = AscendMemorySaverDeviceHandle(
+        _SleepExecutor(trace), kv_transfer=_RegisteringDecodePeer(trace)
+    )
+
+    handle.finish_kv_resume()
+
+    assert trace == ["clear_kv_buffers", "device.synchronize", "peer.register"]
+
+
 def test_nccl_suspend_and_resume_reach_the_communicators(monkeypatch):
     from tokenspeed.runtime.execution import device as device_module
 

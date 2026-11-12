@@ -8,6 +8,11 @@ The tested build at `ee1742b06d2c0e59cb0b357288ec29ee190cfd2d` has the same
 source tree. The snapshot includes the allocator lifetime and ownership fixes
 from [!39221](https://gitcode.com/Ascend/pytorch/pull/39221) and
 [!45270](https://gitcode.com/Ascend/pytorch/pull/45270).
+PTA builds must provide `NPUPluggableAllocator`, `MemPool`, `use_mem_pool`,
+and ACL Graph capture into a user pool with allocator ownership preserved.
+The worker checks the required APIs and native library ABI at startup. Use
+the real-device probes to qualify other PTA and CANN builds, since API
+presence alone does not establish the allocator's routing behavior.
 
 ```bash
 cmake -S tokenspeed-kernel-npu/memory-saver -B /tmp/ascend-saver-build \
@@ -16,9 +21,11 @@ cmake --build /tmp/ascend-saver-build
 export TOKENSPEED_NPU_MEMORY_SAVER_LIBRARY=/tmp/ascend-saver-build/libascend_memory_saver.so
 ```
 
-The callback selects a tag and content policy at allocation. The backend
-queries the minimum huge-page allocation granularity, reserves a virtual
-address, and maps a physical allocation. On the target A2 and CANN 9.0.0,
+The callback selects a tag and content policy at allocation. The checked
+pause and resume calls use `weights`, `kv_cache`, and `acl_graph` to select
+regions. Rebuild the library with this checkout to use native ABI v2.
+The backend queries the minimum huge-page allocation granularity, reserves
+a virtual address, and maps a physical allocation. On the target A2 and CANN 9.0.0,
 the minimum huge-page granularity measured 2 MiB and same-device
 `aclrtMapMem` provided read/write access. An explicit `aclrtMemSetAccess`
 returned `507899` in the device probe, so this same-device path relies on
@@ -27,6 +34,36 @@ the access granted by the map.
 their physical pages. Discard segments release physical pages directly.
 `resume` maps new physical pages at the reserved addresses and restores any
 snapshots. The caller reinitializes discarded contents before reading them.
+
+## Pool and storage policy
+
+Each managed pool has a release tag, a retention policy, and an allocation
+scope. Pools with the same release tag can have separate scopes or policies.
+Release and resume act on all managed pools for that tag. `cpu_backup` copies
+contents to pinned host memory. `discard` restores the virtual mapping with
+undefined contents. `remain` uses ordinary PTA allocation and creates no
+saver pool.
+
+A joint capture uses one pool and one retention policy. Separately captured
+graphs can explicitly reuse that pool or select independent scopes. A request
+to share a pool must match the registered scope and policy. The graph handle
+does not by itself define which storage is shared. Input buffers and graph
+metadata allocated outside capture follow their own allocation scopes.
+
+Serving currently backs up weights and the captured ACL Graph pool and
+discards the KV arena. The intended placement for target and draft storage
+requires the following conditions.
+
+| Storage | Target | Frozen draft | Condition |
+| --- | --- | --- | --- |
+| Weights | `discard` | `remain` or `cpu_backup` | Reload all discarded weights in place before serving resumes. |
+| RoPE tables | `cpu_backup` | `remain` or `cpu_backup` | Preserve these non-checkpoint buffers explicitly. Aliased storage has one policy. |
+| Activation storage | `discard` | `discard` | Verify replay fully writes each allocation before its first read. Preserve joint pool contents while any of its allocations need backup. |
+| KV arena | `discard` | `discard` | Reinitialize the arena before serving resumes. |
+
+The policy probe exercises explicit tensor placement and overwrite-only
+graphs. Serving these policies requires a complete model update contract,
+explicit ownership of persistent buffers, and Ascend draft capture support.
 
 Use one device and one ACL context per process. Before pause or resume,
 the caller stops launches and new allocations and drains outstanding

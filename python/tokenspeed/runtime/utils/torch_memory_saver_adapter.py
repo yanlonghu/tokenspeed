@@ -22,15 +22,16 @@ from abc import ABC
 from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
+from functools import cache
 
 import torch
 
-try:
-    import torch_memory_saver
 
-    _primary_memory_saver = torch_memory_saver.TorchMemorySaver()
-except ImportError:
-    pass
+@cache
+def _gpu_memory_saver():
+    from torch_memory_saver import TorchMemorySaver
+
+    return TorchMemorySaver()
 
 
 _communication_initializers: ContextVar[list[Callable[[], None]] | None] = ContextVar(
@@ -91,12 +92,6 @@ class TorchMemorySaverAdapter(ABC):
         """
         raise NotImplementedError
 
-    def npu_graph(self, graph, *, pool, stream, tag: str, auto_dispatch_capture: bool):
-        raise NotImplementedError
-
-    def assert_active(self) -> None:
-        """Check any allocator-side execution gate."""
-
     def pause(self, tag: str | None = None):
         raise NotImplementedError
 
@@ -106,7 +101,9 @@ class TorchMemorySaverAdapter(ABC):
 
 class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
     def configure_subprocess(self):
-        return torch_memory_saver.configure_subprocess()
+        from torch_memory_saver import configure_subprocess
+
+        return configure_subprocess()
 
     @contextmanager
     def region(self, tag: str | None = None, enable_cpu_backup: bool = False):
@@ -114,7 +111,7 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
         # weights vs kv_cache regions can be paused/resumed independently.
         # enable_cpu_backup=True offloads (and restores) contents to CPU on
         # pause (weights); False discards them (kv_cache).
-        with _defer_communication_initializers(), _primary_memory_saver.region(
+        with _defer_communication_initializers(), _gpu_memory_saver().region(
             tag=tag or "default", enable_cpu_backup=enable_cpu_backup
         ):
             yield
@@ -122,7 +119,7 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
     def cuda_graph(self, graph, *, pool, stream, tag: str):
         # Requires the library's preload hook mode, which configure_subprocess
         # sets up for the scheduler processes.
-        return _primary_memory_saver.cuda_graph(
+        return _gpu_memory_saver().cuda_graph(
             cuda_graph=graph,
             pool=pool,
             stream=stream,
@@ -131,10 +128,10 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
         )
 
     def pause(self, tag: str | None = None):
-        return _primary_memory_saver.pause(tag=tag)
+        return _gpu_memory_saver().pause(tag=tag)
 
     def resume(self, tag: str | None = None):
-        return _primary_memory_saver.resume(tag=tag)
+        return _gpu_memory_saver().resume(tag=tag)
 
 
 class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
@@ -148,14 +145,6 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
 
     def cuda_graph(self, graph, *, pool, stream, tag: str):
         return torch.cuda.graph(graph, pool=pool, stream=stream)
-
-    def npu_graph(self, graph, *, pool, stream, tag: str, auto_dispatch_capture: bool):
-        return torch.npu.graph(
-            graph,
-            pool=pool,
-            stream=stream,
-            auto_dispatch_capture=auto_dispatch_capture,
-        )
 
     def pause(self, tag: str | None = None):
         pass

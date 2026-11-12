@@ -21,13 +21,14 @@ enum class Tag { Weights, KV, Graph };
 enum class Policy { Backup, Discard };
 enum class Phase { Active, Pausing, Paused, Resuming, Releasing };
 constexpr uint64_t kHugePageReservation = 1;
+constexpr int kSaverAbiVersion = 2;
 thread_local char last_error[2048] = {};
 
 const char *tag_name(Tag t) {
   switch (t) {
   case Tag::Weights: return "weights";
   case Tag::KV: return "kv_cache";
-  case Tag::Graph: return "cuda_graph"; // Historical TokenSpeed control-plane name.
+  case Tag::Graph: return "acl_graph";
   }
   return "invalid";
 }
@@ -45,9 +46,9 @@ int parse_tag(const char *tag) {
   if (!tag) return -1;
   if (std::strcmp(tag, "weights") == 0) return static_cast<int>(Tag::Weights);
   if (std::strcmp(tag, "kv_cache") == 0) return static_cast<int>(Tag::KV);
-  if (std::strcmp(tag, "cuda_graph") == 0 || std::strcmp(tag, "graph") == 0)
+  if (std::strcmp(tag, "acl_graph") == 0)
     return static_cast<int>(Tag::Graph);
-  throw std::runtime_error("unknown tag; use weights, kv_cache, cuda_graph, or NULL");
+  throw std::runtime_error("unknown tag; use weights, kv_cache, acl_graph, or NULL");
 }
 void checked(aclError status, const char *operation) {
   if (status != 0)
@@ -363,7 +364,7 @@ public:
       else ++transitional;
     }
     std::ostringstream out;
-    out << "{\"abi_version\":1,\"segments\":" << blocks.size()
+    out << "{\"abi_version\":" << kSaverAbiVersion << ",\"segments\":" << blocks.size()
         << ",\"context_bound\":" << (context_bound ? "true" : "false")
         << ",\"bound_device\":" << bound_device << ",\"bound_context\":\"" << bound_context << '"'
         << ",\"requested_bytes\":" << requested << ",\"reserved_bytes\":" << reserved
@@ -430,7 +431,7 @@ void *allocate_callback(size_t size, int device, Tag tag, Policy policy) noexcep
 } // namespace
 
 extern "C" {
-int saver_abi_version(void) { return 1; }
+int saver_abi_version(void) { return kSaverAbiVersion; }
 int saver_has_callback_fault(void) {
   try { return backend().callback_fault.load(std::memory_order_acquire) ? 1 : 0; }
   catch (...) { return 1; }
@@ -462,7 +463,7 @@ const char *saver_stats(void) {
     result = b.stats();
     return result.c_str();
   } catch (...) {
-    return "{\"abi_version\":1,\"stats_error\":\"cannot build statistics\"}";
+    return "{\"abi_version\":2,\"stats_error\":\"cannot build statistics\"}";
   }
 }
 } // extern C

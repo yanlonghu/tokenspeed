@@ -20,6 +20,7 @@
 
 """CPU checks for managed versus resident native allocation scopes."""
 
+import sys
 from contextlib import contextmanager
 
 import pytest
@@ -73,7 +74,7 @@ class CpuMemorySaver:
 @pytest.fixture
 def memory(monkeypatch):
     saver = CpuMemorySaver()
-    monkeypatch.setattr(adapter, "_primary_memory_saver", saver, raising=False)
+    monkeypatch.setattr(adapter, "_gpu_memory_saver", lambda: saver)
     return saver
 
 
@@ -140,3 +141,10 @@ def test_disabled_adapter_initializes_communication_immediately(memory):
         assert outputs[0].item() == 23
     memory.pause(tag="weights")
     assert outputs[0].item() == 23
+
+
+def test_npu_and_disabled_gpu_can_construct_adapters_without_gpu_package(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch_memory_saver", None)
+    adapter.TorchMemorySaverAdapter.create(enable=True, device="npu")
+    with adapter.TorchMemorySaverAdapter.create(enable=False, device="cuda").region():
+        pass

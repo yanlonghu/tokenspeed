@@ -17,7 +17,7 @@
 extern "C" {
 #endif
 
-/* ABI v1. Bind the worker's NPU device before calling any mutating API.
+/* ABI v2. Bind the worker's NPU device before calling any mutating API.
  * The caller must stop new launches/allocations and wait for all prior users
  * before pause/resume. Final free synchronizes the current device before
  * unmapping; the owner must still prevent new uses of the released storage.
@@ -39,7 +39,7 @@ SAVER_API void *graph_discard_malloc(size_t size, int device, aclrtStream stream
 /* Retires a known allocation even if context or device validation fails. */
 SAVER_API void saver_free(void *ptr, size_t size, int device, aclrtStream stream);
 
-/* tag: weights, kv_cache, cuda_graph (graph alias), or NULL for all.
+/* tag: weights, kv_cache, acl_graph, or NULL for all.
  * Return 0 on success, 1 on failure. A failed batch can be partially applied;
  * keep the external launch gate closed and retry pause/resume/release.
  */

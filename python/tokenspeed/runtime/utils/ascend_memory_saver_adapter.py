@@ -23,16 +23,17 @@
 import ctypes
 import json
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from threading import RLock
 
 import torch
 
 from tokenspeed.runtime.utils.ascend_memory_saver_state import (
+    AllocationPolicy,
     OwnedPool,
+    PoolKey,
     PoolState,
-    require_supported_pta,
 )
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
     TorchMemorySaverAdapter,
@@ -61,8 +62,8 @@ class NativeBackend:
         self.library.saver_abi_version.restype = ctypes.c_int
         self.library.saver_has_callback_fault.argtypes = []
         self.library.saver_has_callback_fault.restype = ctypes.c_int
-        if self.library.saver_abi_version() != 1:
-            raise RuntimeError("Unsupported Ascend memory saver ABI")
+        if self.library.saver_abi_version() != 2:
+            raise RuntimeError("Rebuild the Ascend memory saver library for ABI 2")
         for name in ("saver_pause", "saver_resume"):
             operation = getattr(self.library, name)
             operation.argtypes = [ctypes.c_char_p]
@@ -99,10 +100,17 @@ class NativeBackend:
 class DeviceState:
     def __init__(self, device: int):
         # Import only in the worker, after its device has been selected.
-        from torch_npu.npu import memory
-        from torch_npu.version import git_version
+        try:
+            from torch_npu.npu import memory
 
-        require_supported_pta(git_version)
+            self.pluggable_allocator = memory.NPUPluggableAllocator
+            self.mem_pool = memory.MemPool
+            self.use_mem_pool = memory.use_mem_pool
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                "Ascend memory saver requires the PTA pluggable allocator and "
+                "MemPool APIs documented in tokenspeed-kernel-npu/memory-saver/README.md"
+            ) from exc
         expandable_segments = []
         for item in os.environ.get("PYTORCH_NPU_ALLOC_CONF", "").split(","):
             key, _, value = item.partition(":")
@@ -117,7 +125,6 @@ class DeviceState:
         self.device = device
         self.library_path = _library_path()
         self.native = NativeBackend(self.library_path)
-        self.memory = memory
         self.state = PoolState(
             backend=self.native, make_pool=self.make_pool, synchronize=self.synchronize
         )
@@ -127,22 +134,22 @@ class DeviceState:
             raise RuntimeError("Ascend memory saver cannot switch devices")
         torch.npu.synchronize()
 
-    def make_pool(self, tag: str, backup: bool) -> OwnedPool:
+    def make_pool(self, key: PoolKey) -> OwnedPool:
         names = {
-            ("weights", True): "weights_backup_malloc",
-            ("kv_cache", False): "kv_malloc",
-            ("cuda_graph", True): "graph_backup_malloc",
+            ("weights", AllocationPolicy.CPU_BACKUP): "weights_backup_malloc",
+            ("weights", AllocationPolicy.DISCARD): "weights_discard_malloc",
+            ("kv_cache", AllocationPolicy.DISCARD): "kv_malloc",
+            ("acl_graph", AllocationPolicy.CPU_BACKUP): "graph_backup_malloc",
+            ("acl_graph", AllocationPolicy.DISCARD): "graph_discard_malloc",
         }
         try:
-            symbol = names[(tag, backup)]
+            symbol = names[(key.tag, key.policy)]
         except KeyError as exc:
             raise ValueError(
-                f"Unsupported Ascend allocation policy: {(tag, backup)!r}"
+                f"Unsupported Ascend allocation policy for {key.tag}: {key.policy}"
             ) from exc
-        allocator = self.memory.NPUPluggableAllocator(
-            self.library_path, symbol, "saver_free"
-        )
-        return OwnedPool(allocator, self.memory.MemPool(allocator.allocator()))
+        allocator = self.pluggable_allocator(self.library_path, symbol, "saver_free")
+        return OwnedPool(allocator, self.mem_pool(allocator.allocator()))
 
 
 # Multiple adapters in a worker must share pool IDs and the pause gate.
@@ -170,23 +177,42 @@ class AscendMemorySaverAdapter(TorchMemorySaverAdapter):
         _library_path()
         yield
 
-    @contextmanager
     def region(self, tag: str | None = None, enable_cpu_backup: bool = False):
         if tag is None:
             raise ValueError("Ascend allocations require an explicit memory tag")
+        policy = (
+            AllocationPolicy.CPU_BACKUP
+            if enable_cpu_backup
+            else AllocationPolicy.DISCARD
+        )
+        return self.allocation_region(PoolKey(tag, policy, tag))
+
+    @contextmanager
+    def allocation_region(self, key: PoolKey):
         state = self._state()
         with _defer_communication_initializers():
-            with state.state.region(tag=tag, backup=enable_cpu_backup) as owned:
-                with state.memory.use_mem_pool(owned.pool):
+            with state.state.region(key) as owned:
+                route = state.use_mem_pool(owned.pool) if owned else nullcontext()
+                with route:
                     yield
             state.native.check_health()
 
     @contextmanager
-    def npu_graph(self, graph, *, pool, stream, tag: str, auto_dispatch_capture: bool):
+    def npu_graph(
+        self,
+        graph,
+        *,
+        pool,
+        stream,
+        tag: str,
+        policy: str,
+        pool_scope: str,
+        auto_dispatch_capture: bool,
+    ):
         state = self._state()
-        # Preserve pool contents until the graph's writes before reads are audited.
-        with state.state.region(tag=tag, backup=True) as owned:
-            selected = state.state.require_graph_pool(owned=owned, requested=pool)
+        key = PoolKey(tag, AllocationPolicy(policy), pool_scope)
+        with state.state.region(key) as owned:
+            selected = state.state.graph_pool(owned=owned, requested=pool)
             with torch.npu.graph(
                 graph,
                 pool=selected,

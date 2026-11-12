@@ -23,24 +23,26 @@
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import StrEnum
 from threading import RLock
 from typing import Any, Protocol
 
-# Both commits have the same source tree. The stock PTA wheel has MemPool APIs
-# too, but it lacks the required allocator ownership and lifetime fixes.
-_SUPPORTED_PTA_COMMITS = (
-    "ee1742b06d2c0e59cb0b357288ec29ee190cfd2d",
-    "74e6508b896f630e5d5cacd39a3877047e91c19a",
-)
+MEMORY_TAGS = frozenset({"weights", "kv_cache", "acl_graph"})
 
 
-def require_supported_pta(git_version: str) -> None:
-    if git_version not in _SUPPORTED_PTA_COMMITS:
-        expected = ", ".join(_SUPPORTED_PTA_COMMITS)
-        raise RuntimeError(
-            f"Ascend memory saver requires a supported torch_npu build ({expected}); "
-            f"found {git_version}"
-        )
+class AllocationPolicy(StrEnum):
+    CPU_BACKUP = "cpu_backup"
+    DISCARD = "discard"
+    REMAIN = "remain"
+
+
+@dataclass(frozen=True)
+class PoolKey:
+    """A release tag can own independent pools with different lifetimes."""
+
+    tag: str
+    policy: AllocationPolicy
+    scope: str
 
 
 class Backend(Protocol):
@@ -65,42 +67,51 @@ class PoolState:
         self,
         *,
         backend: Backend,
-        make_pool: Callable[[str, bool], OwnedPool],
+        make_pool: Callable[[PoolKey], OwnedPool],
         synchronize: Callable[[], None],
     ):
         self.backend = backend
         self.make_pool = make_pool
         self.synchronize = synchronize
-        self.pools: dict[tuple[str, bool], OwnedPool] = {}
+        self.pools: dict[PoolKey, OwnedPool] = {}
         self.paused: set[str] = set()
         self.failed: set[str] = set()
         self.region_active = False
         self.lock = RLock()
 
-    def _pool(self, tag: str, backup: bool) -> OwnedPool:
-        if tag not in ("weights", "kv_cache", "cuda_graph"):
-            raise ValueError(f"Unsupported Ascend memory tag: {tag!r}")
-        if tag in self.paused or tag in self.failed:
-            raise RuntimeError(f"Memory tag {tag!r} is paused or needs recovery")
-        key = (tag, backup)
+    def _pool(self, key: PoolKey) -> OwnedPool | None:
+        if key.tag not in MEMORY_TAGS:
+            raise ValueError(f"Unsupported Ascend memory tag: {key.tag!r}")
+        if key.tag in self.paused or key.tag in self.failed:
+            raise RuntimeError(f"Memory tag {key.tag!r} is paused or needs recovery")
+        if key.policy is AllocationPolicy.REMAIN:
+            return None
         if key not in self.pools:
-            self.pools[key] = self.make_pool(tag, backup)
+            self.pools[key] = self.make_pool(key)
         return self.pools[key]
 
     @contextmanager
-    def region(self, *, tag: str, backup: bool) -> Iterator[OwnedPool]:
+    def region(self, key: PoolKey) -> Iterator[OwnedPool | None]:
         # Hold the gate for the entire capture/allocation scope.
         with self.lock:
             if self.region_active:
                 raise RuntimeError("Cannot nest Ascend memory allocation scopes")
-            owned = self._pool(tag, backup)
+            owned = self._pool(key)
             self.region_active = True
             try:
                 yield owned
             finally:
                 self.region_active = False
 
-    def require_graph_pool(self, *, owned: OwnedPool, requested) -> tuple[int, int]:
+    def graph_pool(
+        self, *, owned: OwnedPool | None, requested
+    ) -> tuple[int, int] | None:
+        if owned is None:
+            if requested is not None and any(
+                entry.pool.id == requested for entry in self.pools.values()
+            ):
+                raise ValueError("A resident graph cannot use a managed pool")
+            return requested
         selected = owned.pool.id
         if requested is not None and requested != selected:
             raise ValueError(
@@ -116,10 +127,10 @@ class PoolState:
 
     def _targets(self, tag: str | None) -> set[str]:
         if tag is not None:
-            if tag not in ("weights", "kv_cache", "cuda_graph"):
+            if tag not in MEMORY_TAGS:
                 raise ValueError(f"Unsupported Ascend memory tag: {tag!r}")
             return {tag}
-        return {"weights", "kv_cache", "cuda_graph"}
+        return set(MEMORY_TAGS)
 
     def pause(self, tag: str | None) -> None:
         with self.lock:

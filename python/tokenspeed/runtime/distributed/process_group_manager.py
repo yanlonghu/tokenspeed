@@ -230,7 +230,11 @@ class ProcessGroupManager:
         return self._dedicated_groups[key]
 
     def shutdown(self) -> None:
-        """Close the distributed world and release this worker's group references."""
+        """Destroy the distributed world and drop the manager's cached groups.
+
+        Call after worker threads finish, while the device runtime can still
+        tear down its communicators.
+        """
         if dist.is_initialized():
             dist.destroy_process_group()
         self._process_groups.clear()

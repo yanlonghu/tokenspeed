@@ -29,15 +29,15 @@ import time
 import traceback
 from pathlib import Path
 
-from gsm8k_pause_resume import (
+from test_gsm8k_pause_resume import (
     DATASET_SHA256,
-    PTA_COMMIT,
     compare,
     encode_prompt,
     ephemeral_loopback_address,
     infer,
     load_dataset,
     make_server_args,
+    pta_git_version,
     read_trace,
     require,
     summarize,
@@ -176,8 +176,10 @@ def run(args, report):
         reference["dataset_sha256"] == DATASET_SHA256,
         "Original run used a different test set",
     )
+    git_version = pta_git_version(torch_npu, args.pta_commit)
     require(
-        torch_npu.version.git_version == reference["torch_npu_git"] == args.pta_commit,
+        torch_npu.__version__ == reference["torch_npu"]
+        and git_version == reference["torch_npu_git"],
         "PTA version mismatch",
     )
     require(
@@ -247,7 +249,8 @@ def run(args, report):
             "server_args": server_args,
             "server_max_concurrency": server_concurrency,
             "torch": torch.__version__,
-            "torch_npu_git": torch_npu.version.git_version,
+            "torch_npu": torch_npu.__version__,
+            "torch_npu_git": git_version,
             "tokenspeed_path": str(next(iter(tokenspeed.__path__))),
             "host": str(host),
         }
@@ -275,7 +278,7 @@ def run(args, report):
 
     def transition(driver, request):
         start = time.perf_counter()
-        reply = asyncio.run(control_reply(driver, request(tags=["cuda_graph"])))
+        reply = asyncio.run(control_reply(driver, request(tags=["acl_graph"])))
         require(reply.success, f"{request.__name__}: {reply!r}")
         return time.perf_counter() - start
 
@@ -364,7 +367,7 @@ def run(args, report):
             if preceding == "a2":
                 pair("a2", "b", second, restored)
             report["graph"] = verify_graph_trace(
-                startup, before, read_trace(trace_path), ["cuda_graph"], args.tp_size
+                startup, before, read_trace(trace_path), ["acl_graph"], args.tp_size
             )
     report["launcher_exit_code"] = driver.process.returncode
     require(
@@ -409,7 +412,7 @@ def main():
     parser.add_argument("--request-timeout", type=float, default=180)
     parser.add_argument("--startup-timeout", type=float, default=240)
     parser.add_argument("--control-timeout", type=float, default=180)
-    parser.add_argument("--pta-commit", default=PTA_COMMIT)
+    parser.add_argument("--pta-commit", help="Require this PTA Git commit if specified")
     args = parser.parse_args()
     if not (
         1 <= args.concurrency <= 64 and args.target_count >= 1 and args.warmup >= 0

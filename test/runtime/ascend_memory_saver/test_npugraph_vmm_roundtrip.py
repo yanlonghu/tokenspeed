@@ -29,7 +29,7 @@ import json
 import os
 from pathlib import Path
 
-from gsm8k_pause_resume import POLICIES, PTA_COMMIT, require
+from test_gsm8k_pause_resume import POLICIES, pta_git_version, require
 
 
 def transition_bytes(event):
@@ -85,7 +85,7 @@ class Saver:
             function = getattr(self.library, name)
             function.argtypes = arguments
             function.restype = result
-        require(self.library.saver_abi_version() == 1, "Unexpected native ABI")
+        require(self.library.saver_abi_version() == 2, "Unexpected native ABI")
 
     def stats(self):
         return json.loads(self.library.saver_stats())
@@ -134,12 +134,13 @@ def run(args, report):
     import torch_npu
     from torch_npu.npu import memory
 
-    require(torch_npu.version.git_version == args.pta_commit, "Unexpected PTA build")
+    git_version = pta_git_version(torch_npu, args.pta_commit)
     require(torch.npu.device_count() == 1, "Expected a single visible NPU")
     torch.npu.set_device(0)
     saver = Saver(args.library)
     report.update(
-        pta_commit=torch_npu.version.git_version,
+        torch_npu=torch_npu.__version__,
+        pta_commit=git_version,
         physical_npu=os.environ["ASCEND_RT_VISIBLE_DEVICES"],
         device=torch.npu.get_device_name(0),
         library_sha256=hashlib.sha256(args.library.read_bytes()).hexdigest(),
@@ -199,7 +200,7 @@ def run(args, report):
         verify_owned(stats, weight, "weights")
         verify_owned(stats, kv, "kv_cache")
         for output in outputs:
-            verify_owned(stats, output, "cuda_graph")
+            verify_owned(stats, output, "acl_graph")
         del output
         managed_bytes = stats["physical_bytes"]
         report["initial"] = stats
@@ -229,7 +230,7 @@ def run(args, report):
                 )
                 asleep = free_bytes(torch)
                 require(asleep > before, "CANN did not report released HBM")
-                for tag in ("cuda_graph", "weights", "kv_cache"):
+                for tag in ("acl_graph", "weights", "kv_cache"):
                     require(
                         saver.transition("resume", tag) == freed[tag],
                         f"{tag} size changed",
@@ -326,7 +327,7 @@ def main():
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cycles", type=int, default=3)
-    parser.add_argument("--pta-commit", default=PTA_COMMIT)
+    parser.add_argument("--pta-commit", help="Require this PTA Git commit if specified")
     parser.add_argument("--teardown-paused", action="store_true")
     args = parser.parse_args()
     args.library = args.library.resolve(strict=True)

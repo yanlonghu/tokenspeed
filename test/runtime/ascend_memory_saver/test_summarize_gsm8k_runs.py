@@ -28,7 +28,7 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
-from gsm8k_pause_resume import summary_stats
+from test_gsm8k_pause_resume import summary_stats
 
 REQUEST_STATS = re.compile(
     r"Req: (?P<rid>[a-f0-9]{32}) Finish! RequestStats\(.*?"

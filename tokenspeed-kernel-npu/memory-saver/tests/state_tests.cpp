@@ -30,7 +30,7 @@ void expect_pattern(void *ptr, size_t size, unsigned char value) {
 
 void backup_roundtrip() {
   reset();
-  REQUIRE(saver_abi_version() == 1);
+  REQUIRE(saver_abi_version() == 2);
   constexpr size_t n = 7000;
   void *ptr = weights_malloc(n, 0, nullptr);
   REQUIRE(ptr != nullptr);
@@ -62,10 +62,14 @@ void default_policies_tags_and_paused_free() {
   void *g = graph_malloc(100, 0, nullptr);
   REQUIRE(w && k && g);
   pattern(w, 100, 0x11); pattern(g, 100, 0x22);
-  ok(saver_pause("graph")); // Alias for historical cuda_graph tag.
+  REQUIRE(stat_has("\"tag\":\"acl_graph\""));
+  REQUIRE(saver_pause("cuda_graph") != 0);
+  REQUIRE(saver_pause("graph") != 0);
+  REQUIRE(fake_acl::live_physical() == 3);
+  ok(saver_pause("acl_graph"));
   REQUIRE(fake_acl::live_physical() == 2);
   REQUIRE(fake_acl::live_host() == 1);
-  ok(saver_resume("cuda_graph")); expect_pattern(g, 100, 0x22);
+  ok(saver_resume("acl_graph")); expect_pattern(g, 100, 0x22);
   ok(saver_pause(nullptr));
   REQUIRE(fake_acl::live_physical() == 0);
   REQUIRE(fake_acl::live_host() == 2); // Weights+graph backup, KV discard.
@@ -86,13 +90,13 @@ void pause_failure_matrix() {
     void *p = graph_backup_malloc(321, 0, nullptr); REQUIRE(p);
     pattern(p, 321, 0x37);
     fake_acl::fail_next(api);
-    REQUIRE(saver_pause("cuda_graph") != 0);
+    REQUIRE(saver_pause("acl_graph") != 0);
     REQUIRE(std::strlen(saver_last_error()) != 0);
     REQUIRE(graph_backup_malloc(16, 0, nullptr) == nullptr); // Tag stays closed.
     REQUIRE(fake_acl::live_reservations() == 1);
-    ok(saver_pause("cuda_graph"));
+    ok(saver_pause("acl_graph"));
     REQUIRE(fake_acl::live_host() == 1 && fake_acl::live_physical() == 0);
-    ok(saver_resume("cuda_graph")); expect_pattern(p, 321, 0x37);
+    ok(saver_resume("acl_graph")); expect_pattern(p, 321, 0x37);
     ok(saver_release(p));
   }
 }
@@ -163,7 +167,7 @@ void free_failure_matrix() {
     ok(saver_collect_failed());
   }
   reset(); void *p = graph_malloc(12, 0, nullptr); REQUIRE(p);
-  ok(saver_pause("cuda_graph")); fake_acl::fail_next("aclrtFreeHost");
+  ok(saver_pause("acl_graph")); fake_acl::fail_next("aclrtFreeHost");
   REQUIRE(saver_release(p) != 0);
   REQUIRE(fake_acl::live_host() == 1 && fake_acl::live_reservations() == 1);
   ok(saver_release(p));
@@ -233,7 +237,7 @@ void callback_retires_before_validation(bool wrong_context) {
   void *p = graph_malloc(size, 0, nullptr);
   REQUIRE(p);
   if (!wrong_context) {
-    ok(saver_pause("graph"));
+    ok(saver_pause("acl_graph"));
     REQUIRE(fake_acl::live_host() == 1);
   }
 

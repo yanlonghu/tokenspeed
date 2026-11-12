@@ -20,14 +20,18 @@ export TOKENSPEED_NPU_MEMORY_SAVER_LIBRARY=/path/to/libascend_memory_saver.so
 
 suite=test/runtime/ascend_memory_saver
 work=$(mktemp -d)
-python "$suite/npugraph_vmm_roundtrip.py" \
+python "$suite/test_npugraph_vmm_roundtrip.py" \
   --library "$TOKENSPEED_NPU_MEMORY_SAVER_LIBRARY" \
   --output "$work/vmm.json"
+python "$suite/test_ascend_pool_policy_probe.py" --output "$work/pool-policy.json"
 ```
 
 The VMM probe checks weight and graph-pool backup, KV discard, physical memory
 release, preserved addresses, replay of two graphs sharing a pool, and final
 cleanup. Use `--teardown-paused` to check cleanup with the regions paused.
+The pool-policy probe uses synthetic target and draft tensors to check weight
+replacement, RoPE backup, resident storage, KV rebuild, and replay with shared
+and independent pools after their allocations are remapped.
 
 ## Qwen3 GSM8K benchmark
 
@@ -44,15 +48,15 @@ printf '%s  %s\n' 3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d
 run="$work/tp1"
 mkdir "$run"
 set -o pipefail
-python "$suite/gsm8k_pause_resume.py" \
+python "$suite/test_gsm8k_pause_resume.py" \
   --model /path/to/Qwen3-0.6B --dataset "$work/gsm8k-test.jsonl" \
   --output-dir "$run/benchmark" --tp-size 1 \
   --concurrency 32 --max-tokens 512 --warmup 32 2>&1 | tee "$run/runner.log"
-python "$suite/summarize_runs.py" --output-dir "$work/summary" "$run"
+python "$suite/test_summarize_gsm8k_runs.py" --output-dir "$work/summary" "$run"
 ```
 
 The benchmark runs both passes in one headless service and defaults to pausing
-only the graph pool. Use `--tags kv_cache weights cuda_graph` for all managed
+only the graph pool. Use `--tags kv_cache weights acl_graph` for all managed
 regions. Use `--limit 4 --concurrency 2 --max-tokens 16` for a smoke run.
 The probes accept `--pta-commit` to verify the expected PTA identity.
 
@@ -69,13 +73,13 @@ without another capture.
 Run targeted controls using the result directory of a completed full pass.
 
 ```bash
-python "$suite/gsm8k_targeted_control.py" \
+python "$suite/test_gsm8k_targeted_control.py" \
   --model /path/to/Qwen3-0.6B --dataset "$work/gsm8k-test.jsonl" \
   --output-dir "$work/serial-control" --tp-size 1 \
   --original "$run/benchmark" --selection correctness --correctness-cap 12 \
   --concurrency 1 --mode aa-then-pause
 
-python "$suite/gsm8k_targeted_control.py" \
+python "$suite/test_gsm8k_targeted_control.py" \
   --model /path/to/Qwen3-0.6B --dataset "$work/gsm8k-test.jsonl" \
   --output-dir "$work/concurrent-control" --tp-size 1 \
   --original "$run/benchmark" --selection changed-plus-control --target-count 96 \

@@ -35,10 +35,16 @@ _spec = importlib.util.spec_from_file_location("ascend_saver_state_under_test", 
 _module = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = _module
 _spec.loader.exec_module(_module)
+AllocationPolicy = _module.AllocationPolicy
+PoolKey = _module.PoolKey
 OwnedPool = _module.OwnedPool
 PoolState = _module.PoolState
-require_supported_pta = _module.require_supported_pta
 validate_memory_saver_scope = _module.validate_memory_saver_scope
+
+WEIGHTS = PoolKey("weights", AllocationPolicy.CPU_BACKUP, "target")
+KV = PoolKey("kv_cache", AllocationPolicy.DISCARD, "decode")
+GRAPH = PoolKey("acl_graph", AllocationPolicy.CPU_BACKUP, "decode")
+WEIGHTS_DISCARD = PoolKey("weights", AllocationPolicy.DISCARD, "target")
 
 
 @dataclass
@@ -53,16 +59,16 @@ class FakeNpu:
         self.saved = {}
         self.fail_resume = False
 
-    def make_pool(self, tag, backup):
+    def make_pool(self, key):
         pool = FakePool((0, self.next_id))
         self.next_id += 1
-        self.content[(tag, backup)] = bytearray(b"initial")
+        self.content[key] = bytearray(b"initial")
         return OwnedPool(object(), pool)
 
     def pause(self, tag):
         for key, data in list(self.content.items()):
-            if tag is None or key[0] == tag:
-                if key[1]:
+            if tag is None or key.tag == tag:
+                if key.policy is AllocationPolicy.CPU_BACKUP:
                     self.saved[key] = bytes(data)
                 self.content[key] = None
 
@@ -70,24 +76,8 @@ class FakeNpu:
         if self.fail_resume:
             raise RuntimeError("injected H2D failure")
         for key, data in list(self.content.items()):
-            if (tag is None or key[0] == tag) and data is None:
+            if (tag is None or key.tag == tag) and data is None:
                 self.content[key] = bytearray(self.saved.get(key, bytes(7)))
-
-
-class SupportedPtaTests(unittest.TestCase):
-    def test_equivalent_backport_commits_are_supported(self):
-        for git_version in (
-            "ee1742b06d2c0e59cb0b357288ec29ee190cfd2d",
-            "74e6508b896f630e5d5cacd39a3877047e91c19a",
-        ):
-            with self.subTest(git_version=git_version):
-                require_supported_pta(git_version)
-
-    def test_a_stock_build_is_rejected(self):
-        with self.assertRaisesRegex(
-            RuntimeError, "requires a supported torch_npu build"
-        ):
-            require_supported_pta("912882db")
 
 
 class PoolStateTests(unittest.TestCase):
@@ -100,104 +90,130 @@ class PoolStateTests(unittest.TestCase):
         )
 
     def test_weights_restore_kv_discard_and_partial_resume_stays_blocked(self):
-        with self.state.region(tag="weights", backup=True):
-            self.backend.content[("weights", True)][:] = b"weights"
-        with self.state.region(tag="kv_cache", backup=False):
-            self.backend.content[("kv_cache", False)][:] = b"history"
+        with self.state.region(WEIGHTS):
+            self.backend.content[WEIGHTS][:] = b"weights"
+        with self.state.region(KV):
+            self.backend.content[KV][:] = b"history"
         self.state.pause(None)
         self.state.resume("weights")
-        self.assertEqual(self.backend.content[("weights", True)], b"weights")
+        self.assertEqual(self.backend.content[WEIGHTS], b"weights")
         with self.assertRaises(RuntimeError):
             self.state.assert_active()
         self.state.resume("kv_cache")
         with self.assertRaises(RuntimeError):
             self.state.assert_active()
-        self.state.resume("cuda_graph")
+        self.state.resume("acl_graph")
         self.state.assert_active()
-        self.assertEqual(self.backend.content[("kv_cache", False)], bytes(7))
+        self.assertEqual(self.backend.content[KV], bytes(7))
 
     def test_region_reentry_reuses_pool_and_preserves_updated_content(self):
-        with self.state.region(tag="weights", backup=True) as first:
-            self.backend.content[("weights", True)][:] = b"changed"
-        with self.state.region(tag="weights", backup=True) as second:
+        with self.state.region(WEIGHTS) as first:
+            self.backend.content[WEIGHTS][:] = b"changed"
+        with self.state.region(WEIGHTS) as second:
             self.assertIs(first, second)
-        self.assertEqual(self.backend.content[("weights", True)], b"changed")
+        self.assertEqual(self.backend.content[WEIGHTS], b"changed")
 
     def test_allocation_blocked_while_paused_even_before_first_allocation(self):
         self.state.pause("weights")
         with self.assertRaises(RuntimeError):
-            with self.state.region(tag="weights", backup=True):
+            with self.state.region(WEIGHTS):
                 self.fail("unmapped pool became available")
         self.state.resume("weights")
-        with self.state.region(tag="weights", backup=True):
+        with self.state.region(WEIGHTS):
             pass
 
     def test_pause_all_before_any_pool_blocks_all_three_tags(self):
         self.state.pause(None)
         with self.assertRaises(RuntimeError):
             self.state.assert_active()
-        for tag, backup in [
-            ("weights", True),
-            ("kv_cache", False),
-            ("cuda_graph", True),
-        ]:
-            with self.subTest(tag=tag), self.assertRaises(RuntimeError):
-                with self.state.region(tag=tag, backup=backup):
+        for key in (WEIGHTS, KV, GRAPH):
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                with self.state.region(key):
                     self.fail("paused empty tag became usable")
         self.state.resume(None)
         self.state.assert_active()
 
     def test_resume_failure_blocks_use_until_successful_retry(self):
-        with self.state.region(tag="cuda_graph", backup=True):
+        with self.state.region(GRAPH):
             pass
-        self.state.pause("cuda_graph")
+        self.state.pause("acl_graph")
         self.backend.fail_resume = True
         with self.assertRaisesRegex(RuntimeError, "H2D"):
-            self.state.resume("cuda_graph")
+            self.state.resume("acl_graph")
         with self.assertRaises(RuntimeError):
             self.state.assert_active()
         self.backend.fail_resume = False
-        self.state.resume("cuda_graph")
+        self.state.resume("acl_graph")
         self.state.assert_active()
-        self.assertEqual(self.backend.content[("cuda_graph", True)], b"initial")
+        self.assertEqual(self.backend.content[GRAPH], b"initial")
 
     def test_pause_rejects_live_capture_and_scope_exception_cleans_gate(self):
         with self.assertRaisesRegex(ValueError, "capture failed"):
-            with self.state.region(tag="cuda_graph", backup=True):
+            with self.state.region(GRAPH):
                 with self.assertRaises(RuntimeError):
                     self.state.pause(None)
                 raise ValueError("capture failed")
-        self.state.pause("cuda_graph")
-        self.state.resume("cuda_graph")
+        self.state.pause("acl_graph")
+        self.state.resume("acl_graph")
         self.state.assert_active()
 
     def test_region_cannot_nest_a_different_pool(self):
-        with self.state.region(tag="weights", backup=True):
+        with self.state.region(WEIGHTS):
             with self.assertRaisesRegex(RuntimeError, "Cannot nest"):
-                with self.state.region(tag="kv_cache", backup=False):
+                with self.state.region(KV):
                     self.fail("a nested pool changed allocator ownership")
-        with self.state.region(tag="kv_cache", backup=False):
+        with self.state.region(KV):
             pass
 
     def test_explicit_shared_graph_pool_preserved_foreign_pool_rejected(self):
-        with self.state.region(tag="cuda_graph", backup=True) as owned:
-            selected = self.state.require_graph_pool(owned=owned, requested=None)
+        with self.state.region(GRAPH) as owned:
+            selected = self.state.graph_pool(owned=owned, requested=None)
             self.assertEqual(
-                self.state.require_graph_pool(owned=owned, requested=selected),
+                self.state.graph_pool(owned=owned, requested=selected),
                 selected,
             )
             with self.assertRaises(ValueError):
-                self.state.require_graph_pool(owned=owned, requested=(0, 99))
+                self.state.graph_pool(owned=owned, requested=(0, 99))
 
     def test_same_tag_distinct_policies_both_release(self):
-        with self.state.region(tag="weights", backup=True) as backup:
+        with self.state.region(WEIGHTS) as backup:
             pass
-        with self.state.region(tag="weights", backup=False) as discard:
+        with self.state.region(WEIGHTS_DISCARD) as discard:
             self.assertNotEqual(backup.pool.id, discard.pool.id)
         self.state.pause("weights")
         self.state.resume("weights")
-        self.assertEqual(self.backend.content[("weights", True)], b"initial")
-        self.assertEqual(self.backend.content[("weights", False)], bytes(7))
+        self.assertEqual(self.backend.content[WEIGHTS], b"initial")
+        self.assertEqual(self.backend.content[WEIGHTS_DISCARD], bytes(7))
+
+    def test_one_tag_can_share_or_separate_graph_pools_by_scope(self):
+        shared = PoolKey("acl_graph", AllocationPolicy.DISCARD, "joint")
+        target = PoolKey("acl_graph", AllocationPolicy.DISCARD, "target")
+        draft = PoolKey("acl_graph", AllocationPolicy.DISCARD, "draft")
+        with self.state.region(shared) as first:
+            shared_pool = self.state.graph_pool(owned=first, requested=None)
+        with self.state.region(shared) as second:
+            self.assertEqual(
+                self.state.graph_pool(owned=second, requested=shared_pool), shared_pool
+            )
+        with self.state.region(target) as target_pool:
+            with self.assertRaisesRegex(ValueError, "not the managed pool"):
+                self.state.graph_pool(owned=target_pool, requested=shared_pool)
+        with self.state.region(draft) as draft_pool:
+            self.assertNotEqual(target_pool.pool.id, draft_pool.pool.id)
+        self.state.pause("acl_graph")
+        self.assertEqual(self.backend.content, dict.fromkeys((shared, target, draft)))
+
+    def test_resident_storage_does_not_create_or_borrow_a_managed_pool(self):
+        resident = PoolKey("acl_graph", AllocationPolicy.REMAIN, "draft")
+        with self.state.region(GRAPH) as graph:
+            managed_pool = graph.pool.id
+        with self.state.region(resident) as graph:
+            self.assertIsNone(graph)
+            self.assertIsNone(self.state.graph_pool(owned=graph, requested=None))
+            with self.assertRaisesRegex(ValueError, "cannot use a managed pool"):
+                self.state.graph_pool(owned=graph, requested=managed_pool)
+        self.state.pause("acl_graph")
+        self.assertEqual(self.backend.content, {GRAPH: None})
 
     def test_unsupported_deployments_fail_before_device_work(self):
         valid = dict(

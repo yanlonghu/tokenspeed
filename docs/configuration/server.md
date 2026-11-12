@@ -267,7 +267,8 @@ restores whatever is released:
 | --- | --- | --- |
 | `kv_cache` | the cache arena's device regions | zeroed; a PD engine registers it with the transfer engine again |
 | `weights` | model and draft parameters | CPU backup, or remapped and invalid until a complete update; frozen draft allocations retain CPU backup |
-| `cuda_graph` | the decode graphs' private memory pool | CUDA replays rewrite discarded contents. Ascend restores a Host backup before replay. |
+| `cuda_graph` | the CUDA-compatible decode graphs' private memory pool | replays rewrite discarded contents |
+| `acl_graph` | the Ascend decode graphs' private memory pool | Host backup is restored before replay |
 | `nccl` | NCCL communicator buffers (`ProcessGroupNCCL.suspend`); requires a PyTorch build with suspend support and NCCL 2.29.7 or later | resumed in place |
 
 A release waits until the scheduler is drained, and on a disaggregated
@@ -289,15 +290,13 @@ resume. Other device memory (input buffers, communication workspaces such as
 symmetric memory or DeepEP buffers, the prefill CUDA graphs) stays resident.
 
 On Ascend, memory saving supports one rank with `--weight-memory-policy cpu_backup`.
-Use CANN 9 and a PTA 2.9 build from the [ACL Graph backport snapshot](https://gitcode.com/Huyanlong/pytorch/commit/74e6508b896f630e5d5cacd39a3877047e91c19a)
-or the identical source tree at `ee1742b06d2c0e59cb0b357288ec29ee190cfd2d`.
-The backports preserve allocator ownership and remove HCCL pending-event
-query tracking before ACL Graph capture. Run a `ts-host` built from the same
-TokenSpeed checkout as the Python launcher. Set
+See the [Ascend backend requirements and pool policies](../../tokenspeed-kernel-npu/memory-saver/README.md)
+for the validated CANN and PTA builds and required allocator behavior. Run a
+`ts-host` built from the same TokenSpeed checkout as the Python launcher. Set
 `TOKENSPEED_NPU_MEMORY_SAVER_LIBRARY` to the absolute path of the built Ascend
 allocator library and set `PYTORCH_NPU_ALLOC_CONF=expandable_segments:False`
 before startup. Decode graphs and their virtual addresses stay live across
-release and resume. For a new checkpoint, resume `weights` and `cuda_graph`,
+release and resume. For a new checkpoint, resume `weights` and `acl_graph`,
 run `update_weights_from_disk`, then resume `kv_cache` to clear it and resume
 admissions. Communication resources stay resident.
 If an Ascend allocator transition fails, the serving worker must restart.

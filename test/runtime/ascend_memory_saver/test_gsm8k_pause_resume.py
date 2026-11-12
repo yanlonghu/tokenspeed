@@ -42,17 +42,23 @@ DATASET_SOURCE = (
 )
 DATASET_SHA256 = "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14"
 DATASET_SIZE = 1319
-PTA_COMMIT = "ee1742b06d2c0e59cb0b357288ec29ee190cfd2d"
 # Match TokenSpeed's test/single_request_benchmark/gsm8k_decode.py prompt.
 PROMPT_SUFFIX = (
     "\nPlease reason step by step, and put your final answer within \\boxed{}."
 )
-POLICIES = {"weights": "backup", "kv_cache": "discard", "cuda_graph": "backup"}
+POLICIES = {"weights": "backup", "kv_cache": "discard", "acl_graph": "backup"}
 
 
 def require(condition, message):
     if not condition:
         raise RuntimeError(message)
+
+
+def pta_git_version(torch_npu, expected):
+    version = getattr(getattr(torch_npu, "version", None), "git_version", None)
+    if expected is not None:
+        require(version == expected, f"Expected PTA commit {expected}, got {version}")
+    return version
 
 
 def load_dataset(path):
@@ -479,12 +485,11 @@ def run(args, report):
         {
             "torch": torch.__version__,
             "torch_npu": torch_npu.__version__,
-            "torch_npu_git": torch_npu.version.git_version,
+            "torch_npu_git": pta_git_version(torch_npu, args.pta_commit),
             "tokenspeed_path": str(next(iter(tokenspeed.__path__))),
             "visible_devices": os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
         }
     )
-    require(torch_npu.version.git_version == args.pta_commit, "Unexpected PTA version")
     require(
         torch.npu.device_count() == args.tp_size,
         "Visible device count does not match TP size",
@@ -676,9 +681,9 @@ def main():
     parser.add_argument("--request-timeout", type=float, default=180)
     parser.add_argument("--startup-timeout", type=float, default=240)
     parser.add_argument("--control-timeout", type=float, default=180)
-    parser.add_argument("--pta-commit", default=PTA_COMMIT)
+    parser.add_argument("--pta-commit", help="Require this PTA Git commit if specified")
     parser.add_argument(
-        "--tags", nargs="+", choices=list(POLICIES), default=["cuda_graph"]
+        "--tags", nargs="+", choices=list(POLICIES), default=["acl_graph"]
     )
     args = parser.parse_args()
     if (
@@ -687,10 +692,10 @@ def main():
         or not 2 <= args.max_tokens <= 2048
         or not 0 <= args.warmup <= DATASET_SIZE
         or len(set(args.tags)) != len(args.tags)
-        or "cuda_graph" not in args.tags
+        or "acl_graph" not in args.tags
     ):
         parser.error(
-            "Invalid limit, concurrency, token cap, warmup or tags; cuda_graph is required"
+            "Invalid limit, concurrency, token cap, warmup or tags; acl_graph is required"
         )
     if args.dist_init_addr is None:
         args.dist_init_addr = ephemeral_loopback_address()

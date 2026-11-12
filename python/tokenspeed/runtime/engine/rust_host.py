@@ -323,7 +323,8 @@ def start_rust_host(
             str(server_args.enable_async_logging).lower(),
         ]
         if server_args.device == "npu":
-            # Triton-Ascend's native exit handlers expect the Python GIL.
+            # Triton-Ascend's native exit handlers can release Python objects
+            # during libc exit, including when the memory saver is disabled.
             command.extend(["--restore-gil-for-exit", "true"])
         popen = subprocess.Popen(
             command,
@@ -1361,6 +1362,7 @@ class HostBootstrap:
                 TorchMemorySaverAdapter.create(
                     enable=server_args.enable_memory_saver, device=server_args.device
                 ),
+                graph_tag="acl_graph" if server_args.device == "npu" else "cuda_graph",
                 nccl_suspendable=server_args.device != "npu"
                 and nccl_suspend_supported(),
             )
