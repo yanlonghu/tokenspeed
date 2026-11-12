@@ -785,6 +785,17 @@ class DeviceHandle:
         self.settle()
         self._executor.device_module.synchronize()
 
+    def check_memory_transition(
+        self, tags: list[str], *, release: bool
+    ) -> tuple[bool, str]:
+        """Return a control refusal if the local weight or KV state rejects the request."""
+        if self._weight_memory is not None:
+            try:
+                self._weight_memory.check_memory_transition(tags, release=release)
+            except RuntimeError as error:
+                return False, str(error)
+        return True, ""
+
     def prepare_kv_release(self) -> None:
         """Quiesce everything that can touch the KV arena before it is unmapped.
 
@@ -832,11 +843,14 @@ class DeviceHandle:
         new physical pages.
         """
         self.settle()
-        self._executor.token_to_kv_pool.clear_kv_buffers()
+        self._clear_resumed_kv_buffers()
         if self._kv_transfer is not None:
             self._kv_transfer.restore_cache_registration()
         if self._weight_memory is not None:
             self._weight_memory.mark_kv_resumed()
+
+    def _clear_resumed_kv_buffers(self) -> None:
+        self._executor.token_to_kv_pool.clear_kv_buffers()
 
     def suspend_nccl(self) -> None:
         """Free the NCCL communicators' buffers; they stay usable after resume."""
@@ -1000,18 +1014,24 @@ class DeviceHandle:
         ):
             raise TypeError(f"unsupported weight-load request {type(req).__name__}")
         state = self._weight_memory
-        if state is None:
-            return True, "ready for weight update"
-        if (
-            state.policy == "discard"
-            and type(req) is not UpdateWeightsFromMooncakeReqInput
-        ):
-            return False, "Discard policy requires a complete Model Updater SDK update"
-        try:
-            state.check_update()
-        except RuntimeError as exc:
-            return False, str(exc)
+        if state is not None:
+            if state.policy == "discard" and not self._is_complete_weight_update(req):
+                return (
+                    False,
+                    "Discard policy requires a complete Model Updater SDK update",
+                )
+            try:
+                state.check_update()
+            except RuntimeError as exc:
+                return False, str(exc)
         return True, "ready for weight update"
+
+    def _is_complete_weight_update(self, req) -> bool:
+        from tokenspeed.runtime.engine.io_struct import (
+            UpdateWeightsFromMooncakeReqInput,
+        )
+
+        return type(req) is UpdateWeightsFromMooncakeReqInput
 
     def update_weights(self, req) -> tuple[bool, str]:
         """Apply one in-place RL weight-sync request, ordered against forwards.
@@ -1056,7 +1076,13 @@ class DeviceHandle:
                 )
             ),
             DestroyWeightsUpdateGroupReqInput: runner.destroy_weights_update_group,
-            UpdateWeightFromDiskReqInput: runner.update_weights_from_disk,
+            UpdateWeightFromDiskReqInput: (
+                lambda req: (
+                    runner.update_weights_from_disk(req, require_complete=True)
+                    if require_complete
+                    else runner.update_weights_from_disk(req)
+                )
+            ),
         }
         handler = handlers.get(type(req))
         if handler is None:
@@ -1890,12 +1916,19 @@ def build_device_side(
             policy=server_args.weight_memory_policy, models=update_models
         )
 
+    handle_type: type[DeviceHandle] = DeviceHandle
+    if server_args.enable_memory_saver and executor.device == "npu":
+        from tokenspeed.runtime.execution.ascend_memory_saver_device import (
+            AscendMemorySaverDeviceHandle,
+        )
+
+        handle_type = AscendMemorySaverDeviceHandle
     return DeviceBuild(
         host_cache=host_cache,
         specs=specs,
         transfer=kv_transfer,
         encoder_model_facts=encoder_model_facts,
-        handle=DeviceHandle(
+        handle=handle_type(
             executor,
             host_cache_executor=host_cache_executor,
             kv_transfer=kv_transfer,

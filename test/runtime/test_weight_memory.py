@@ -127,6 +127,32 @@ def test_discard_requires_kv_release_and_resident_update_storage():
     assert not state.failed
 
 
+def test_memory_preflight_checks_the_whole_discard_transition():
+    model = TinyModel()
+    state = WeightMemoryState(policy="discard", models=[model])
+    with pytest.raises(RuntimeError, match="Release KV"):
+        state.check_memory_transition(["weights"], release=True)
+    state.check_memory_transition(["kv_cache", "weights"], release=True)
+    assert state.resident and state.valid and not state.kv_released
+
+    discard(model, state)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        state.check_memory_transition(["weights", "kv_cache"], release=False)
+    state.check_memory_transition(["weights"], release=False)
+    assert not state.resident and state.kv_released and not state.failed
+    state.resume(lambda: None)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        state.check_memory_transition(["kv_cache"], release=False)
+
+    state.begin_update()
+    state.finish_update(success=True)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        state.check_memory_transition(["kv_cache"], release=False)
+    state.commit_update(True)
+    state.check_memory_transition(["kv_cache"], release=False)
+    assert state.kv_released
+
+
 @pytest.mark.parametrize("phase", ["release", "resume", "update"])
 def test_transition_failure_is_sticky_and_blocks_all_recovery(phase):
     model = TinyModel()
@@ -188,7 +214,9 @@ def test_cpu_backup_preserves_legacy_kv_before_weight_resume_order():
     state = WeightMemoryState(policy="cpu_backup", models=[model])
     assert state.preserved == []
     saved = model.weight.detach().clone()
+    state.check_memory_transition(["weights"], release=True)
     state.release(lambda: None)
+    state.check_memory_transition(["kv_cache"], release=False)
     state.before_kv_resume()
     state.mark_kv_resumed()
     state.resume(lambda: None)

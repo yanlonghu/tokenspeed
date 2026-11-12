@@ -79,6 +79,16 @@ Start here:
 - [Compatible Parameters](https://lightseek.org/tokenspeed/configuration/compatible-parameters)
 - [Parallelism](https://lightseek.org/tokenspeed/serving/parallelism)
 
+## Ascend ACL Graph Memory Saver
+
+On Ascend, TokenSpeed can release memory between rollout windows and reuse the
+original decode graphs after wake. Dense BF16 Qwen3 workers can discard target
+weights and load a complete replacement checkpoint before generation resumes.
+
+- [User guide](docs/serving/ascend-memory-saver.md)
+- [Design and CUDA comparison](docs/design/ascend-acl-graph-memory-saver.md)
+- [Hardware validation report](docs/serving/ascend-memory-saver-test-report.md)
+
 ## Citation
 
 ```bibtex

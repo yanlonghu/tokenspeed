@@ -258,6 +258,14 @@ pub trait DataPlane {
         request: &ts_wire::control::ProfileReq,
     ) -> Result<(bool, String), DataPlaneError>;
 
+    /// Check the whole ordered release or wake request without touching any
+    /// memory region. A refused prerequisite is a normal control reply.
+    fn check_memory_transition(
+        &mut self,
+        tags: &[String],
+        release: bool,
+    ) -> Result<(bool, String), DataPlaneError>;
+
     /// Free these memory regions, in order, once the scheduler drained.
     fn release_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError>;
 
@@ -1722,16 +1730,22 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(reduced[0] != 0)
     }
 
+    /// Whether every member of this rank's replica says yes.
+    fn replica_all(&mut self, local: bool) -> Result<bool, LoopError> {
+        if self.ranks.replica.size() == 1 {
+            return Ok(local);
+        }
+        let reduced =
+            self.ranks
+                .mesh
+                .all_reduce(&self.ranks.replica, &[i64::from(local)], Reduce::Min)?;
+        Ok(reduced[0] != 0)
+    }
+
     /// Whether every rank sharing this decision says yes: MIN over the
     /// replica, then over the attention-DP ranks.
     fn converge(&mut self, local: bool) -> Result<bool, LoopError> {
-        let mut agreed = i64::from(local);
-        if self.ranks.replica.size() > 1 {
-            agreed = self
-                .ranks
-                .mesh
-                .all_reduce(&self.ranks.replica, &[agreed], Reduce::Min)?[0];
-        }
+        let mut agreed = i64::from(self.replica_all(local)?);
         if let Some(world) = &self.ranks.dp {
             agreed = self.ranks.mesh.all_reduce(world, &[agreed], Reduce::Min)?[0];
         }
@@ -2013,8 +2027,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         })
     }
 
-    /// Resolve a local pause once drained; release memory only once every
-    /// rank has stopped admissions and drained its work.
+    /// Resolve a drain once its prerequisites hold. Controls owns the pending
+    /// action and admission hold, and each scheduler owns its L1 index.
+    ///
+    /// A replica-wide KV release stays cancellable while any rank reports that
+    /// L1 is busy. Once clearing starts, a failure stops the loop because peers
+    /// may already have changed their indexes.
     fn finish_drain(&mut self, release_pending: bool) -> Result<(), LoopError> {
         let drained = self.controls.admit_blocked() && self.drained();
         // Every rank joins, even without a local drain. An idle but unpaused
@@ -2042,14 +2060,36 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             if !all_paused {
                 return Ok(());
             }
-            if tags.iter().any(|tag| tag == "kv_cache") && !self.scheduler.clear_l1_cache() {
+            let clears_kv = tags.iter().any(|tag| tag == "kv_cache");
+            if self.config.controls.replica_memory_transitions {
+                let tags = tags.clone();
+                // A queued weight operation or a wake could have changed the
+                // local prerequisites while this release was draining.
+                if let Some(refusal) = self.refuse_memory_transition(&tags, true)? {
+                    self.controls.take_drain();
+                    self.controls.refuse_release(&refusal);
+                    return Ok(());
+                }
+                if clears_kv {
+                    if !self.replica_all(self.scheduler.can_clear_l1_cache())? {
+                        return Ok(());
+                    }
+                    let cleared = self.scheduler.clear_l1_cache();
+                    if !self.replica_all(cleared)? {
+                        return Err(LoopError::Control(
+                            "L1 cache clear failed after the replica agreed it was ready"
+                                .to_owned(),
+                        ));
+                    }
+                }
+            } else if clears_kv && !self.scheduler.clear_l1_cache() {
                 return Ok(());
             }
         }
         match self.controls.take_drain().expect("checked above") {
             Drain::Pause => self.controls.finish_pause_drain(),
             Drain::Release(tags) => {
-                self.data_plane.release_memory(&tags)?;
+                self.apply_memory_transition(&tags, true)?;
                 tracing::info!(?tags, "memory released");
                 self.controls.finish_release(tags);
             }
@@ -2057,6 +2097,40 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 tracing::info!("drained for a forward reload");
                 self.controls.mark_reload_ready();
             }
+        }
+        Ok(())
+    }
+
+    /// Return a control refusal if any rank's read-only prerequisites fail.
+    /// Forward-thread and mesh errors propagate as loop errors.
+    fn refuse_memory_transition(
+        &mut self,
+        tags: &[String],
+        release: bool,
+    ) -> Result<Option<String>, LoopError> {
+        let (local, message) = self.data_plane.check_memory_transition(tags, release)?;
+        if self.replica_all(local)? {
+            return Ok(None);
+        }
+        Ok(Some(if local {
+            "memory transition prerequisites were refused on another rank in the replica".to_owned()
+        } else {
+            message
+        }))
+    }
+
+    /// Run the ordered local device transition and, when required by the
+    /// protocol, await replica completion before callers publish tag state.
+    fn apply_memory_transition(&mut self, tags: &[String], release: bool) -> Result<(), LoopError> {
+        // Return device errors to the host so it can notify the launcher
+        // before cleanup. A peer may still be waiting in a device collective.
+        if release {
+            self.data_plane.release_memory(tags)?;
+        } else {
+            self.data_plane.resume_memory(tags)?;
+        }
+        if self.config.controls.replica_memory_transitions {
+            self.replica_all(true)?;
         }
         Ok(())
     }
@@ -2140,10 +2214,27 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                         message,
                     }));
             }
+            Effect::ReleaseMemory(tags) => {
+                if let Some(refusal) = self.refuse_memory_transition(&tags, true)? {
+                    // Refusal before the drain leaves admissions and caches alone.
+                    self.controls.refuse_release(&refusal);
+                } else {
+                    self.controls.begin_release(tags);
+                }
+            }
             Effect::ResumeMemory(tags) => {
-                self.data_plane.resume_memory(&tags)?;
-                tracing::info!(?tags, "memory resumed");
-                self.controls.finish_resume(&tags);
+                let refusal = if self.config.controls.replica_memory_transitions {
+                    self.refuse_memory_transition(&tags, false)?
+                } else {
+                    None
+                };
+                if let Some(refusal) = refusal {
+                    self.controls.refuse_resume(&refusal);
+                } else {
+                    self.apply_memory_transition(&tags, false)?;
+                    tracing::info!(?tags, "memory resumed");
+                    self.controls.finish_resume(&tags);
+                }
             }
         }
         Ok(())

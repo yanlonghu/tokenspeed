@@ -50,9 +50,10 @@ use ts_wire::{
 
 /// Every memory region, in release order: the KV cache first (a PD engine
 /// deregisters it from the transfer engine before it is unmapped), NCCL last
-/// (nothing may issue a collective after it is suspended). Resume runs the
-/// reverse order.
-pub const MEMORY_REGIONS: [&str; 4] = ["kv_cache", "weights", "cuda_graph", "nccl"];
+/// (nothing may issue a collective after it is suspended). An engine exposes
+/// its configured graph region. Resume runs in reverse order.
+pub const MEMORY_REGIONS: [&str; 5] = ["kv_cache", "weights", "cuda_graph", "acl_graph", "nccl"];
+const GPU_MEMORY_REGIONS: [&str; 4] = ["kv_cache", "weights", "cuda_graph", "nccl"];
 
 /// How far a pause reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +82,8 @@ pub enum Drain {
 pub struct ControlConfig {
     /// `--enable-memory-saver`: memory can be released.
     pub memory_saver: bool,
+    /// The runtime requires replica-wide release and wake checks (protocol 3).
+    pub replica_memory_transitions: bool,
     /// The regions this engine can release (`nccl` needs an NCCL that can
     /// suspend its communicators).
     pub memory_regions: Vec<String>,
@@ -271,8 +274,8 @@ pub struct Controls {
     drain: Option<Drain>,
     /// Memory regions released.
     released: Vec<String>,
-    /// A release was accepted and has not freed its regions or failed.
-    release_pending: bool,
+    /// A release is draining, with the pause to restore if preflight refuses.
+    release_prior_pause: Option<PauseState>,
     /// A forward reload was accepted and has not been answered.
     reload_pending: bool,
     /// The pending reload found the scheduler unpaused, so it resumes it.
@@ -314,6 +317,8 @@ pub enum Effect {
     None,
     /// Start or stop the profiler (the data plane answers).
     Profile,
+    /// Check these regions before starting a release drain.
+    ReleaseMemory(Vec<String>),
     /// Resume these memory regions now, in order, then reply.
     ResumeMemory(Vec<String>),
 }
@@ -325,7 +330,7 @@ impl Controls {
             state: PauseState::Unpaused,
             drain: None,
             released: Vec::new(),
-            release_pending: false,
+            release_prior_pause: None,
             reload_pending: false,
             resume_after_reload: false,
             reload_ready: false,
@@ -407,7 +412,7 @@ impl Controls {
     /// refuses new requests then, as their transfers would name memory that
     /// is about to go away.
     pub fn releasing_or_released(&self) -> bool {
-        self.release_pending || !self.released.is_empty()
+        self.release_prior_pause.is_some() || !self.released.is_empty()
     }
 
     /// Take (once) whether an `abort` pause has to abort what runs.
@@ -540,9 +545,24 @@ impl Controls {
         self.reply(pause_reply(true, ""));
     }
 
+    /// The replica accepted the release prerequisites. Stop admissions and drain.
+    pub fn begin_release(&mut self, tags: Vec<String>) {
+        self.release_prior_pause = Some(self.state);
+        self.request_drain(false, Drain::Release(tags));
+    }
+
+    /// A refused release preserves the pause in effect before the request.
+    pub fn refuse_release(&mut self, message: &str) {
+        if let Some(pause) = self.release_prior_pause.take() {
+            self.state = pause;
+            self.cancel_unscheduled = false;
+        }
+        self.reply(release_reply(false, message));
+    }
+
     /// Memory regions were freed: freeze and reply.
     pub fn finish_release(&mut self, tags: Vec<String>) {
-        self.release_pending = false;
+        self.release_prior_pause = None;
         for tag in tags {
             if !self.released.contains(&tag) {
                 self.released.push(tag);
@@ -556,10 +576,21 @@ impl Controls {
     pub fn finish_resume(&mut self, tags: &[String]) {
         self.released.retain(|tag| !tags.contains(tag));
         if self.released.is_empty() {
-            // Fully awake: schedule again.
             self.state = PauseState::Unpaused;
+            if self.config.replica_memory_transitions {
+                // Keep the admission hold while the release awaits replica readiness.
+                if let Some(prior) = &mut self.release_prior_pause {
+                    *prior = PauseState::Unpaused;
+                    self.state = PauseState::PausedNew;
+                }
+            }
         }
         self.reply(resume_memory_reply(true, ""));
+    }
+
+    /// A refused wake leaves every released tag asleep.
+    pub fn refuse_resume(&mut self, message: &str) {
+        self.reply(resume_memory_reply(false, message));
     }
 
     /// Why a weight load cannot run now: it writes the weights and may issue
@@ -592,12 +623,18 @@ impl Controls {
                 .map(|tag| (*tag).to_owned())
                 .collect());
         };
+        // Keep the GPU tag vocabulary while checking optional regions separately.
+        let known: &[&str] = if available.iter().any(|tag| tag == "acl_graph") {
+            &MEMORY_REGIONS
+        } else {
+            &GPU_MEMORY_REGIONS
+        };
         let bad: Vec<&String> = tags
             .iter()
-            .filter(|tag| !MEMORY_REGIONS.contains(&tag.as_str()))
+            .filter(|tag| !known.contains(&tag.as_str()))
             .collect();
         if !bad.is_empty() {
-            return Err(format!("invalid tags: {bad:?}; valid: {MEMORY_REGIONS:?}"));
+            return Err(format!("invalid tags: {bad:?}; valid: {known:?}"));
         }
         let unavailable: Vec<&String> =
             tags.iter().filter(|tag| !available.contains(tag)).collect();
@@ -639,7 +676,7 @@ impl Controls {
                 ));
             }
             ControlRequest::ReleaseMemoryOccupation(release) => {
-                self.release(release.tags.as_deref(), release_refusal);
+                return self.release(release.tags.as_deref(), release_refusal);
             }
             ControlRequest::ResumeMemoryOccupation(resume) => {
                 return self.resume_memory(resume.tags.as_deref());
@@ -733,6 +770,8 @@ impl Controls {
         self.request_drain(mode == "abort", Drain::Pause);
     }
 
+    /// Reopen admissions once no released tag remains. Cancelling a pending
+    /// release resolves its reply and clears the pause state saved by that drain.
     fn resume(&mut self) {
         if self.reload_pending {
             // The way out of a reload some attention-DP rank never received: it has not run yet.
@@ -751,8 +790,7 @@ impl Controls {
         match self.drain.take() {
             Some(Drain::Pause) => self.reply(pause_reply(false, "resumed before pause drained")),
             Some(Drain::Release(_)) => {
-                self.release_pending = false;
-                self.reply(release_reply(false, "resumed before release drained"));
+                self.refuse_release("resumed before release drained");
             }
             Some(Drain::Reload) => unreachable!("cancel_reload took it"),
             None => {}
@@ -777,21 +815,21 @@ impl Controls {
         std::mem::take(&mut self.resume_after_reload)
     }
 
-    fn release(&mut self, tags: Option<&[String]>, refusal: Option<String>) {
-        let fail = |controls: &mut Self, message: String| {
-            controls.release_pending = false;
-            controls.reply(release_reply(false, &message));
+    fn release(&mut self, tags: Option<&[String]>, refusal: Option<String>) -> Effect {
+        let fail = |controls: &mut Self, message: &str| {
+            // Protocol 3 keeps the prior pause available to cancel an active drain.
+            if !controls.config.replica_memory_transitions {
+                controls.release_prior_pause = None;
+            }
+            controls.reply(release_reply(false, message));
+            Effect::None
         };
         if !self.config.memory_saver {
-            fail(
-                self,
-                "memory saver not enabled (--enable-memory-saver)".to_owned(),
-            );
-            return;
+            return fail(self, "memory saver not enabled (--enable-memory-saver)");
         }
         let tags = match self.normalize_tags(tags, &MEMORY_REGIONS) {
             Ok(tags) => tags,
-            Err(error) => return fail(self, error),
+            Err(error) => return fail(self, &error),
         };
         let already: Vec<&String> = tags
             .iter()
@@ -799,28 +837,28 @@ impl Controls {
             .collect();
         if !already.is_empty() {
             let message = format!("tags already released: {already:?}");
-            return fail(self, message);
+            return fail(self, &message);
         }
         if self.drain.is_some() || self.reload_pending {
-            return fail(
-                self,
-                "a pause, release or reload is already in progress".to_owned(),
-            );
+            return fail(self, "a pause, release or reload is already in progress");
         }
         if self.state == PauseState::PausedAll && self.released.is_empty() {
             // Its drain would let the frozen requests run, and the wake
             // would silently end the keep pause.
             return fail(
                 self,
-                "a keep pause froze the scheduler; resume_scheduler before releasing memory"
-                    .to_owned(),
+                "a keep pause froze the scheduler; resume_scheduler before releasing memory",
             );
         }
         if let Some(refusal) = refusal {
-            return fail(self, format!("cannot release memory: {refusal}"));
+            return fail(self, &format!("cannot release memory: {refusal}"));
         }
-        self.release_pending = true;
-        self.request_drain(false, Drain::Release(tags));
+        if self.config.replica_memory_transitions {
+            Effect::ReleaseMemory(tags)
+        } else {
+            self.begin_release(tags);
+            Effect::None
+        }
     }
 
     fn reload(&mut self, op: ReloadForwardReqInput) {
@@ -1017,10 +1055,171 @@ mod tests {
     fn controls(memory_saver: bool) -> Controls {
         Controls::new(ControlConfig {
             memory_saver,
+            replica_memory_transitions: false,
             memory_regions: vec!["kv_cache".to_owned(), "weights".to_owned()],
             l3_weight_version: None,
             allow_reload_forward: true,
         })
+    }
+
+    fn begin_release(controls: &mut Controls, request: ControlRequest) {
+        if let Effect::ReleaseMemory(tags) = controls.handle(request, None) {
+            controls.begin_release(tags);
+        }
+        assert!(matches!(controls.drain(), Some(Drain::Release(_))));
+    }
+
+    #[test]
+    fn memory_operations_accept_and_order_the_configured_graph_tag() {
+        for (release_order, unavailable) in [
+            (&["kv_cache", "weights", "acl_graph"][..], "cuda_graph"),
+            (
+                &["kv_cache", "weights", "cuda_graph", "nccl"][..],
+                "acl_graph",
+            ),
+        ] {
+            let mut controls = controls(true);
+            controls.config.replica_memory_transitions = release_order.contains(&"acl_graph");
+            controls.config.memory_regions = release_order
+                .iter()
+                .rev()
+                .map(|tag| (*tag).to_owned())
+                .collect();
+            controls.handle(release(Some(vec![unavailable])), None);
+            assert!(controls.drain().is_none());
+            assert_eq!(
+                successes(&controls.take_replies()),
+                [("ReleaseMemoryOccupationReqOutput", false)]
+            );
+
+            let mut requested: Vec<_> = release_order.iter().rev().copied().collect();
+            requested.push("weights");
+            begin_release(&mut controls, release(Some(requested)));
+            let Some(Drain::Release(tags)) = controls.take_drain() else {
+                panic!("the configured regions drain");
+            };
+            assert_eq!(
+                tags.iter().map(String::as_str).collect::<Vec<_>>(),
+                release_order
+            );
+            controls.finish_release(tags);
+            assert_eq!(
+                successes(&controls.take_replies()),
+                [("ReleaseMemoryOccupationReqOutput", true)]
+            );
+
+            let resume_memory = |tags| {
+                ControlRequest::ResumeMemoryOccupation(
+                    ts_wire::control::ResumeMemoryOccupationReqInput {
+                        rid: None,
+                        http_worker_ipc: None,
+                        tags,
+                    },
+                )
+            };
+            assert!(matches!(
+                controls.handle(resume_memory(Some(vec![unavailable.to_owned()])), None),
+                Effect::None
+            ));
+            assert_eq!(
+                successes(&controls.take_replies()),
+                [("ResumeMemoryOccupationReqOutput", false)]
+            );
+            let Effect::ResumeMemory(tags) = controls.handle(
+                resume_memory(Some(
+                    release_order.iter().map(|tag| (*tag).to_owned()).collect(),
+                )),
+                None,
+            ) else {
+                panic!("the configured regions resume");
+            };
+            let resume_order: Vec<_> = release_order.iter().rev().copied().collect();
+            assert_eq!(
+                tags.iter().map(String::as_str).collect::<Vec<_>>(),
+                resume_order
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_memory_tag_errors_use_the_cuda_tag_set() {
+        let mut controls = controls(true);
+        controls.config.memory_regions.push("cuda_graph".to_owned());
+
+        controls.handle(release(Some(vec!["unknown"])), None);
+        let replies = controls.take_replies();
+        let [ControlOutput::ReleaseMemoryOccupation(reply)] = replies.as_slice() else {
+            panic!("the release is refused");
+        };
+        assert!(!reply.success);
+        assert_eq!(
+            reply.message,
+            r#"invalid tags: ["unknown"]; valid: ["kv_cache", "weights", "cuda_graph", "nccl"]"#
+        );
+
+        let wake = ControlRequest::ResumeMemoryOccupation(
+            ts_wire::control::ResumeMemoryOccupationReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                tags: Some(vec!["acl_graph".to_owned()]),
+            },
+        );
+        controls.handle(wake, None);
+        let replies = controls.take_replies();
+        let [ControlOutput::ResumeMemoryOccupation(reply)] = replies.as_slice() else {
+            panic!("the wake is refused");
+        };
+        assert!(!reply.success);
+        assert_eq!(
+            reply.message,
+            r#"invalid tags: ["acl_graph"]; valid: ["kv_cache", "weights", "cuda_graph", "nccl"]"#
+        );
+
+        controls.handle(release(Some(vec!["nccl"])), None);
+        let replies = controls.take_replies();
+        let [ControlOutput::ReleaseMemoryOccupation(reply)] = replies.as_slice() else {
+            panic!("the release is refused");
+        };
+        assert!(!reply.success);
+        assert_eq!(
+            reply.message,
+            r#"tags not releasable on this engine: ["nccl"]; available: ["kv_cache", "weights", "cuda_graph"]"#
+        );
+        assert!(controls.drain().is_none());
+    }
+
+    #[test]
+    fn explicit_empty_gpu_memory_tags_select_no_regions() {
+        let mut controls = controls(true);
+        begin_release(&mut controls, release(Some(vec![])));
+        assert_eq!(controls.take_drain(), Some(Drain::Release(Vec::new())));
+        controls.finish_release(Vec::new());
+        assert_eq!(
+            successes(&controls.take_replies()),
+            [("ReleaseMemoryOccupationReqOutput", true)]
+        );
+        controls.handle(resume(), None);
+        controls.take_replies();
+
+        begin_release(&mut controls, release(None));
+        let Some(Drain::Release(tags)) = controls.take_drain() else {
+            panic!("a release with omitted tags drains");
+        };
+        controls.finish_release(tags);
+        controls.take_replies();
+        let wake = ControlRequest::ResumeMemoryOccupation(
+            ts_wire::control::ResumeMemoryOccupationReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                tags: Some(Vec::new()),
+            },
+        );
+        assert!(matches!(controls.handle(wake, None), Effect::None));
+        assert_eq!(
+            successes(&controls.take_replies()),
+            [("ResumeMemoryOccupationReqOutput", true)]
+        );
+        assert!(controls.memory_released());
     }
 
     #[test]
@@ -1153,6 +1352,7 @@ mod tests {
     fn a_forward_reload_is_refused_on_arrival_without_its_flag_or_under_a_freeze() {
         let mut off = Controls::new(ControlConfig {
             memory_saver: false,
+            replica_memory_transitions: false,
             memory_regions: Vec::new(),
             l3_weight_version: None,
             allow_reload_forward: false,
@@ -1196,6 +1396,7 @@ mod tests {
     fn l3_loads_keep_the_namespace_tied_to_the_checkpoint() {
         let mut l3 = Controls::new(ControlConfig {
             memory_saver: false,
+            replica_memory_transitions: false,
             memory_regions: Vec::new(),
             l3_weight_version: Some("v1".to_owned()),
             allow_reload_forward: false,
@@ -1246,13 +1447,13 @@ mod tests {
 
         // A second release, while the first one's region is released, drains
         // frozen: no forward may run before the memory is back.
-        controls.handle(release(Some(vec!["kv_cache"])), None);
+        begin_release(&mut controls, release(Some(vec!["kv_cache"])));
         let Some(Drain::Release(tags)) = controls.take_drain() else {
             panic!("a release drains");
         };
         controls.finish_release(tags);
         controls.take_replies();
-        controls.handle(release(Some(vec!["weights"])), None);
+        begin_release(&mut controls, release(Some(vec!["weights"])));
         assert!(controls.forward_blocked());
         assert_eq!(
             controls.drain(),
@@ -1296,7 +1497,7 @@ mod tests {
             successes(&controls.take_replies()),
             [("ReleaseMemoryOccupationReqOutput", false)]
         );
-        controls.handle(release(None), None);
+        begin_release(&mut controls, release(None));
         assert!(controls.releasing_or_released());
         let Some(Drain::Release(tags)) = controls.take_drain() else {
             panic!("a release drains");

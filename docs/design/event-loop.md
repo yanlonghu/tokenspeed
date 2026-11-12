@@ -33,9 +33,12 @@ With `--enable-async-logging`, the Rust tracing writer and Python root logger
 also run off the serving threads. Each has a bounded, lossy queue: a slow
 output stream must not introduce I/O backpressure into a round. The host
 owns Python log cleanup explicitly after serving returns, including errors
-and encode ranks. Returning from Rust does not finalize Python, so an
+and encode ranks. A generation failure notifies the launcher before blocking
+cleanup or logging. Returning from Rust does not finalize Python, so an
 `atexit` hook alone cannot drain those records. Cleanup is bounded because
-an output stream can remain stalled.
+an output stream can remain stalled. For Ascend ranks, the launcher asks
+the host to restore the main thread's GIL after log cleanup so Triton-Ascend's
+native exit handlers can run.
 
 The ranks of a replica (an attention-TP group, across every pipeline stage)
 run the same scheduler. They talk over `ts-collective`'s TCP mesh, in fixed
@@ -702,6 +705,28 @@ gate, so every rank joins the tail's readiness agreement when any release is
 pending, including ranks without a release of their own. Ordinary rounds add
 no collective. Readiness is MIN-reduced over the replica and then attention DP
 before any release runs on the forward thread.
+
+The replica's frontend relay broadcasts each release or resume to its
+members. Ascend saver decode uses protocol 3. A forward-thread preflight
+checks the entire ordered tag list before a release can stop admissions or a
+resume can remap any tag. A
+discard-policy weight release requires KV already released or included
+in the request. After discarding weights, resuming KV requires a committed
+weight update, including when the same resume requests the weight tag.
+A preflight refusal returns a failed control reply and leaves the regions
+unchanged. Release checks the prerequisites again after the drain. For KV
+release, the replica agrees
+that every member can clear its Device L1 index before any member clears it.
+A rank with a pending write-back can still hold Device pages at this point.
+Cancelling a drain that is waiting for L1 readiness preserves every index.
+The agreement leaves Host L2 and L3 alone. All L1 clears must succeed before
+any member unmaps KV, and an unexpected clear failure fails the engine.
+Each device transition must complete on every member before the replica
+updates its released tags or sends the success reply. A device or collective
+failure after a transition starts fails the engine. The preflight and
+completion agreements are per replica. CUDA and ROCm use protocol 2 and
+keep the existing drain, local L1 clear and per-rank device transitions.
+The host selects these paths from the runtime's explicit bootstrap capability.
 
 The head gate also agrees whether any DP rank still has released regions.
 Until all regions are restored on every rank, it withholds forward permission

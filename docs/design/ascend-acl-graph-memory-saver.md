@@ -1,0 +1,170 @@
+# Ascend ACL Graph Memory Saver design
+
+## Requirements
+
+A colocated trainer needs to reclaim device memory between rollout windows.
+TokenSpeed must drain serving work, release selected physical allocations, and
+restore serving in the same workers. The next forward must reuse the captured
+executable and the device virtual addresses it recorded. The trainer must be
+able to load a complete new weight version before any rank resumes generation.
+
+- Keep the release and resume calls, tag selection, and checkpoint version
+  contract shared with CUDA. Each backend owns its allocator, graph API, and
+  supported model and communication paths.
+- Give weights, KV cache, and decode graph pools independent lifetimes. Back up
+  bytes that must survive and discard bytes the runtime can safely recreate.
+- Validate transitions across a serving replica before changing device state.
+  Admit requests again only after every rank has finished restoring storage and
+  committed any required weight update.
+- Account for resident memory. The managed graph region covers the decode
+  graph's private allocation pool. Graph handles, persistent input and metadata
+  buffers, and ordinary communication workspaces have separate lifetimes.
+
+See the [Ascend user guide](../serving/ascend-memory-saver.md) for setup and the
+control requests an orchestrator sends.
+
+The integration uses the upstream launcher failure notification and the
+backend-specific packaging of `torch_memory_saver`. The feature selects the
+Ascend allocator only for NPU workers that enable the saver.
+[Rank failure notification #3306](https://github.com/lightseekorg/tokenspeed/pull/3306)
+· [GPU dependency isolation #3310](https://github.com/lightseekorg/tokenspeed/pull/3310)
+
+## CUDA reference flow
+
+TokenSpeed configures the `torch_memory_saver` preload hook before starting
+CUDA workers. Weight and KV construction enter tagged allocator regions.
+Decode graph capture goes through `torch_memory_saver.cuda_graph` so the
+private pool receives the `cuda_graph` tag with discard semantics.
+The allocator selects pools by tag and backup policy. It also recognizes
+managed pointers freed outside the original allocation region.
+[TokenSpeed allocator adapter](https://github.com/lightseekorg/tokenspeed/blob/5bfbd2b3bbb31f3e373ddadb83936db5eb38ac70/python/tokenspeed/runtime/utils/torch_memory_saver_adapter.py)
+· [Reference allocator implementation](https://github.com/fzyzcjy/torch_memory_saver/tree/7078bc36ebc926ced1cd6d314b869c0a0d3d1f18)
+
+1. A managed allocation reserves a virtual address and maps device pages with
+   CUDA virtual memory management (VMM).
+2. Once requests and device work have drained, pause copies backup allocations
+   to host memory, then unmaps and releases physical pages for the selected
+   tags. The address reservations stay live.
+3. Resume maps new physical pages at those same addresses. It restores saved
+   contents for backup allocations. Replay recreates discardable graph
+   temporaries. TokenSpeed clears discarded KV before use.
+4. After a weight discard, the configured Model Updater SDK must replace the
+   complete checkpoint in place. The control plane agrees on admission, load,
+   and commit before it allows KV wake. A compatible NCCL build can separately
+   suspend and resume communicator memory under the `nccl` tag.
+   [Weight update contract](../serving/weight-memory.md)
+   · [TokenSpeed NCCL integration](https://github.com/lightseekorg/tokenspeed/blob/5bfbd2b3bbb31f3e373ddadb83936db5eb38ac70/python/tokenspeed/runtime/distributed/nccl_suspend.py)
+   · [NCCL communicator API](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2297/user-guide/docs/api/comms.html#ncclcommsuspend)
+
+## Ascend allocation and capture
+
+Each worker selects one NPU and its ACL context. The adapter constructs
+`torch_npu` pluggable allocators and installs them only in explicit PTA
+`MemPool` scopes. At capture, it passes the owned pool to ACL Graph. Ordinary
+allocations use PTA's default allocator. The Ascend path uses the native
+`libascend_memory_saver.so` backend. Its checked interface is ABI 2.
+[Python adapter](https://github.com/yanlonghu/tokenspeed/blob/feat/ascend-acl-graph-memory-saver-review/python/tokenspeed/runtime/utils/ascend_memory_saver_adapter.py)
+· [Native backend](https://github.com/yanlonghu/tokenspeed/blob/feat/ascend-acl-graph-memory-saver-review/tokenspeed-kernel-npu/memory-saver/README.md)
+
+| Storage | Policy and lifetime |
+| --- | --- |
+| Target weights | The chosen `cpu_backup` policy copies the managed region to host memory. With `discard`, the model must enumerate immutable buffers to preserve, such as rotary tables, and provide a complete in-place weight update contract. |
+| Independent draft weights | `retain` preserves them through CPU backup. `refresh` puts them in the same update version as the target. The target owns shared parameters, such as tied embeddings or output weights. |
+| KV arena | Discard physical pages. Clear resumed KV and synchronize the zeroing before admission reopens. Release clears scheduler-side device cache references after all ranks agree they are ready. |
+| Decode graph private pool | Discard for audited BF16 MHA paths with greedy sampling and explicit model and draft capability. Other supported capture paths back up the pool to host memory. A shared pool has one compatible retention policy. |
+| Persistent graph inputs, metadata, and communication workspaces | Keep their owning allocations resident, or restore them through their own explicit memory region. Captured HCCL operations continue to use the live communicator and remapped addresses. |
+
+A managed pool is identified by its release tag, retention policy, and
+allocation scope. Several pools can share a tag. Joint capture uses one pool.
+Separate graphs can share a compatible pool or use independent scopes. Pool
+identity and allocator ownership remain valid even when capture ends and frees
+occur outside the original allocation scope.
+
+The native backend reserves an address range with `aclrtReserveMemAddress`,
+obtains physical pages with `aclrtMallocPhysical`, and maps them with
+`aclrtMapMem`. Pause optionally copies contents to pinned host memory and
+calls `aclrtUnmapMem` and `aclrtFreePhysical`. Resume creates physical backing
+at the original address and restores saved bytes. Final free also releases the
+address reservation. [Ascend VMM and allocator details](https://github.com/yanlonghu/tokenspeed/blob/feat/ascend-acl-graph-memory-saver-review/tokenspeed-kernel-npu/memory-saver/README.md)
+
+Graph discard depends on a write-before-read invariant for graph-private
+temporary bytes on every replay path, including padded batches and draft
+verification. The execution graph, owning pool, and recorded pointers survive
+release and resume. The real-device regression overwrites restored graph pages
+before first replay, checks the original graph and addresses, compares tokens
+against a fresh worker, and checks that the graph pool used zero backup bytes.
+[Decode graph data contract](unified_path.md)
+· [Real-device checks](https://github.com/yanlonghu/tokenspeed/blob/feat/ascend-acl-graph-memory-saver-review/test/runtime/ascend_memory_saver/README.md)
+
+## Ascend pause, update, and resume
+
+1. Every rank preflights the ordered release tags. When the replica agrees,
+   the Rust control plane blocks admissions and drains running work, then
+   repeats the transition checks.
+2. For KV release, the replica first checks that every rank can clear its
+   device L1 cache index, then clears the indices and waits for completion.
+   A drain cancelled while waiting for L1 readiness preserves every index.
+   The workers synchronize device work and release the requested tags in
+   order. The control plane records completion after every rank succeeds.
+3. The trainer publishes the next checkpoint. Resume `weights` and
+   `acl_graph`, while `kv_cache` remains released. Device addresses are valid
+   again. Discarded weights still require a checkpoint.
+4. Load a complete target checkpoint from disk or through the Model Updater
+   SDK. The SDK also supports an eligible independent draft in the same
+   version. Every rank verifies required source names and source tensor
+   shapes. The loaders shard and fuse weights into their current storage.
+   All ranks agree that coverage passed before any model rebuilds
+   weight-derived state. The replica commits after all ranks finish and
+   any requested cache namespace change succeeds.
+5. Resume `kv_cache`. Each rank clears its arena and completes wake. The
+   scheduler can then dispatch new work using the original ACL Graph.
+
+An invalid request rejected during preflight leaves the transition unapplied.
+A device transition failure or a checkpoint failure after the update begins
+keeps the replica unavailable. The launcher supervises fatal rank failures.
+[Control and data plane ownership](event-loop.md)
+· [Weight update and failure semantics](../serving/weight-memory.md)
+
+## CUDA and Ascend user interface
+
+| Operation | NVIDIA CUDA | Ascend ACL Graph |
+| --- | --- | --- |
+| Enable | `--enable-memory-saver` and `--weight-memory-policy` with `cpu_backup` or `discard` | Same flags. Use a matching `ts-host`, supported PTA build, and the Ascend saver library. |
+| Release or resume | `release_memory_occupation` and `resume_memory_occupation` | Same calls and optional `tags`. The SMG direct gateway exposes them under `/v1/rl` with `--enable-rl`. |
+| Select managed memory | `kv_cache`, `weights`, `cuda_graph`, and optional `nccl` | `kv_cache`, `weights`, and `acl_graph`. HCCL and its communication workspaces stay resident. |
+| Recover captured execution | Remap at the original addresses and replay the original CUDA Graph. | Remap at the original addresses and replay the original ACL Graph. Audited pools discard and recreate temporary bytes. Other supported pools restore them from host. |
+| Replace discarded target weights | `update_weights_from_mooncake` via a configured Model Updater SDK. | Same SDK request, or `update_weights_from_disk` for a complete eligible target checkpoint. |
+| Receive trainer broadcasts | The NCCL update group can stream compatible updates when weights use CPU backup. | Use disk or the Model Updater SDK with Ascend Memory Saver. |
+| Handle independent draft weights | `--model-update-draft-weights` with `retain` or `refresh` | Same SDK policies. Disk reload uses `retain` when a draft model is present. |
+| Coordinate memory and weights | Host protocol 2 coordinates weight-load admission and commit. | Host protocol 3 also coordinates preflight and completion of memory transitions across the replica. |
+| Handle a fatal rank | Launcher receives the native failure notification and reaps local ranks. | Same launcher mechanism. PTA handles normal HCCL group shutdown. |
+
+## Validation scope
+
+The hardware baseline is Linux aarch64, Atlas A2 (Ascend 910B3), CANN 9.0.0,
+PyTorch 2.9.0, and the PTA 2.9.0-730 backport source tree. The primary
+deployment target is single-node aggregate serving with TP1, TP2, TP4, or
+TP8. Serving collectives stay inside that tensor-parallel replica. Dense
+BF16 Qwen3 has the complete target discard contract. Qwen3 with
+fixed-width chain MTP and default paged MHA checks supported verify widths
+before initializing distributed groups. The A2 kernel registrations support
+widths up to five for this route.
+
+Graph-pool support and weight-update support depend on different model
+capabilities. TP1 Llama EAGLE3, DFLASH, and vanilla DSPARK have audited graph
+discard combinations with CPU-backed weights. The block drafters use full
+attention and verify widths from two to four. Complete target and draft refresh
+through a local Mooncake TCP store was exercised with Qwen3 and a synthetic MTP
+draft. Production SDK providers, cross-node rollout, other Ascend devices or CANN releases, and full native
+draft weight refresh require their own validation.
+
+Short TP4 and TP8 generation tests also showed token variation without a
+pause. That limits the evidence for token-for-token stability at those sizes.
+[Hardware validation report](../serving/ascend-memory-saver-test-report.md)
+· [Hardware acceptance procedure](https://github.com/yanlonghu/tokenspeed/blob/feat/ascend-acl-graph-memory-saver-review/test/runtime/ascend_memory_saver/README.md)
+
+HCCL TP2 subgroup destruction and graph recapture were measured in a separate
+prototype. The supported path keeps HCCL resident and replays the existing graph.
+Faulted communicator destruction and generic HCCL watchdog failures remain
+PTA issues. Measurements from graph-only recapture and garbage-collection
+experiments describe those configurations.
