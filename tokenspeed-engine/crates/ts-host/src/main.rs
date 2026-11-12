@@ -24,7 +24,7 @@
 //! half; `TOKENSPEED_HOST_BINARY` overrides the installed binary):
 //!
 //! ```text
-//! ts-host --python <executable> --control-fd <fd> --enable-async-logging <bool>
+//! ts-host --python <executable> --control-fd <fd> --enable-async-logging <bool> [--restore-gil-for-exit <bool>]
 //! ```
 //!
 //! The rank's arguments arrive on `--control-fd`, and readiness goes back
@@ -96,7 +96,7 @@ const EP_GROUP: u32 = 3;
 #[derive(Debug, thiserror::Error)]
 enum HostError {
     #[error(
-        "usage: ts-host --python <executable> --control-fd <fd> --enable-async-logging <bool>: {0}"
+        "usage: ts-host --python <executable> --control-fd <fd> --enable-async-logging <bool> [--restore-gil-for-exit <bool>]: {0}"
     )]
     Usage(String),
     #[error("{0}")]
@@ -135,12 +135,14 @@ struct Args {
     python: String,
     control_fd: i32,
     enable_async_logging: bool,
+    restore_gil_for_exit: bool,
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, HostError> {
     let mut python = None;
     let mut control_fd = None;
     let mut enable_async_logging = None;
+    let mut restore_gil_for_exit = false;
     while let Some(flag) = args.next() {
         let value = args
             .next()
@@ -161,6 +163,13 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, HostError>
                     ))
                 })?);
             }
+            "--restore-gil-for-exit" => {
+                restore_gil_for_exit = value.parse().map_err(|_| {
+                    HostError::Usage(format!(
+                        "bad --restore-gil-for-exit {value}: use true or false"
+                    ))
+                })?;
+            }
             _ => return Err(HostError::Usage(format!("unknown argument {flag}"))),
         }
     }
@@ -170,6 +179,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, HostError>
             .ok_or_else(|| HostError::Usage("--control-fd is required".to_owned()))?,
         enable_async_logging: enable_async_logging
             .ok_or_else(|| HostError::Usage("--enable-async-logging is required".to_owned()))?,
+        restore_gil_for_exit,
     })
 }
 
@@ -821,37 +831,48 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let _log_guard = logging::init(args.enable_async_logging);
-    let served = (|| {
-        interpreter::start(&args.python).map_err(HostError::Interpreter)?;
-        let served = {
-            // The host does not finalize Python. Drain its logger on success,
-            // error and unwind, before failure notification can kill the rank.
-            let _python_logs = logging::PythonLogGuard;
-            serve(&args)
-        };
-        if served.is_err() {
-            // As `run_event_loop` does: the launcher then stops the other
-            // ranks.
-            let notified = Python::attach(|py| {
-                py.import("tokenspeed.runtime.engine.rust_host")?
-                    .call_method0("notify_launcher_of_failure")
-                    .map(drop)
-            });
-            if let Err(error) = notified {
-                tracing::error!(%error, "could not notify the launcher");
-            }
+    let log_guard = logging::init(args.enable_async_logging);
+    let main_thread = match interpreter::start(&args.python) {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::error!("{}", HostError::Interpreter(error));
+            return ExitCode::FAILURE;
         }
-        served
-    })();
-    match served {
+    };
+    let served = {
+        // The host does not finalize Python. Drain its logger on success,
+        // error and unwind, before failure notification can kill the rank.
+        let _python_logs = logging::PythonLogGuard;
+        serve(&args)
+    };
+    if served.is_err() {
+        // As `run_event_loop` does: the launcher then stops the other ranks.
+        let notified = Python::attach(|py| {
+            py.import("tokenspeed.runtime.engine.rust_host")?
+                .call_method0("notify_launcher_of_failure")
+                .map(drop)
+        });
+        if let Err(error) = notified {
+            tracing::error!(%error, "could not notify the launcher");
+        }
+    }
+    let exit_code = match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!("{error}");
             ExitCode::FAILURE
         }
+    };
+    drop(log_guard);
+    if args.restore_gil_for_exit {
+        main_thread.restore_for_exit();
     }
+    exit_code
 }
+
+#[cfg(test)]
+#[path = "../tests/support/restore_gil_for_exit.rs"]
+mod restore_gil_for_exit_tests;
 
 #[cfg(test)]
 mod tests {

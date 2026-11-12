@@ -309,20 +309,24 @@ def start_rust_host(
         }.get(level, level),
     )
     with start_context:
+        command = [
+            (
+                f"tokenspeed::encode_tp{server_args.mapping.attn.tp_rank}"
+                if server_args.disaggregation_mode == "encode"
+                else rank_process_title(server_args.mapping)
+            ),
+            "--python",
+            sys.executable,
+            "--control-fd",
+            str(child.fileno()),
+            "--enable-async-logging",
+            str(server_args.enable_async_logging).lower(),
+        ]
+        if server_args.device == "npu":
+            # Triton-Ascend's native exit handlers expect the Python GIL.
+            command.extend(["--restore-gil-for-exit", "true"])
         popen = subprocess.Popen(
-            [
-                (
-                    f"tokenspeed::encode_tp{server_args.mapping.attn.tp_rank}"
-                    if server_args.disaggregation_mode == "encode"
-                    else rank_process_title(server_args.mapping)
-                ),
-                "--python",
-                sys.executable,
-                "--control-fd",
-                str(child.fileno()),
-                "--enable-async-logging",
-                str(server_args.enable_async_logging).lower(),
-            ],
+            command,
             executable=binary,
             env=host_env,
             pass_fds=[child.fileno(), held_until_exit],
@@ -1354,8 +1358,11 @@ class HostBootstrap:
             )
             regions = memory_regions(
                 device.handle,
-                TorchMemorySaverAdapter.create(enable=server_args.enable_memory_saver),
-                nccl_suspendable=nccl_suspend_supported(),
+                TorchMemorySaverAdapter.create(
+                    enable=server_args.enable_memory_saver, device=server_args.device
+                ),
+                nccl_suspendable=server_args.device != "npu"
+                and nccl_suspend_supported(),
             )
             # EPD: a multimodal prefill node's first stage receives image
             # embeddings from encode nodes; None for every other rank.
@@ -1640,6 +1647,11 @@ class HostBootstrap:
             self._memory_sampler.stop()
             self._memory_sampler = None
         self._device.shutdown_cache()
+        if self._server_args.device == "npu":
+            # Finish device work and release the process groups while CANN
+            # is still live. The host keeps Python alive through libc exit.
+            torch.npu.synchronize(self._gpu_id)
+            pg_manager.shutdown()
 
 
 def bootstrap(

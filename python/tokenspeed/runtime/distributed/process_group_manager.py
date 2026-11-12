@@ -229,5 +229,13 @@ class ProcessGroupManager:
                     self._dedicated_groups[key] = process_group
         return self._dedicated_groups[key]
 
+    def shutdown(self) -> None:
+        """Close the distributed world and release this worker's group references."""
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        self._process_groups.clear()
+        self._dedicated_groups.clear()
+        self._emulated_rank_groups = None
+
 
 process_group_manager = ProcessGroupManager()

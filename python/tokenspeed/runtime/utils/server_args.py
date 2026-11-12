@@ -862,6 +862,18 @@ class ServerArgs:
         self.resolve_model_defaults()
         self.resolve_launcher_topology()
         self.resolve_parallelism()
+        if self.enable_memory_saver and self.device == "npu":
+            from tokenspeed.runtime.utils.ascend_memory_saver_state import (
+                validate_memory_saver_scope,
+            )
+
+            validate_memory_saver_scope(
+                world_size=self.mapping.world_size,
+                disaggregation_mode=self.disaggregation_mode,
+                speculative_algorithm=self.speculative_algorithm,
+                weight_policy=self.weight_memory_policy,
+                model_update_config=self.model_update_config,
+            )
         self.resolve_memory_and_scheduling()
         self.resolve_kernel_backends()
         self.resolve_cache()

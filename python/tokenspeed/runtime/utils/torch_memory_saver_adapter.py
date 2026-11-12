@@ -51,12 +51,32 @@ def initialize_communication(operation: Callable[[], None]) -> None:
         pending.append(operation)
 
 
+@contextmanager
+def _defer_communication_initializers():
+    pending: list[Callable[[], None]] = []
+    token = _communication_initializers.set(pending)
+    try:
+        yield
+    finally:
+        _communication_initializers.reset(token)
+    # A failed load never initializes communication. Callbacks run only after
+    # the managed allocator scope has exited.
+    for operation in pending:
+        operation()
+
+
 class TorchMemorySaverAdapter(ABC):
     @staticmethod
-    def create(enable: bool):
-        return (
-            _TorchMemorySaverAdapterReal() if enable else _TorchMemorySaverAdapterNoop()
-        )
+    def create(enable: bool, *, device: str) -> "TorchMemorySaverAdapter":
+        if not enable:
+            return _TorchMemorySaverAdapterNoop()
+        if device.split(":", 1)[0] == "npu":
+            from tokenspeed.runtime.utils.ascend_memory_saver_adapter import (
+                AscendMemorySaverAdapter,
+            )
+
+            return AscendMemorySaverAdapter()
+        return _TorchMemorySaverAdapterReal()
 
     def configure_subprocess(self):
         raise NotImplementedError
@@ -71,6 +91,12 @@ class TorchMemorySaverAdapter(ABC):
         """
         raise NotImplementedError
 
+    def npu_graph(self, graph, *, pool, stream, tag: str, auto_dispatch_capture: bool):
+        raise NotImplementedError
+
+    def assert_active(self) -> None:
+        """Check any allocator-side execution gate."""
+
     def pause(self, tag: str | None = None):
         raise NotImplementedError
 
@@ -82,28 +108,16 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
     def configure_subprocess(self):
         return torch_memory_saver.configure_subprocess()
 
+    @contextmanager
     def region(self, tag: str | None = None, enable_cpu_backup: bool = False):
         # tag defaults to "default" in the library; pass it through explicitly so
         # weights vs kv_cache regions can be paused/resumed independently.
         # enable_cpu_backup=True offloads (and restores) contents to CPU on
         # pause (weights); False discards them (kv_cache).
-        @contextmanager
-        def active_region():
-            pending: list[Callable[[], None]] = []
-            token = _communication_initializers.set(pending)
-            try:
-                with _primary_memory_saver.region(
-                    tag=tag or "default", enable_cpu_backup=enable_cpu_backup
-                ):
-                    yield
-            finally:
-                _communication_initializers.reset(token)
-            # A failed model load never initializes communication. The original
-            # allocator region has fully exited before these callbacks run.
-            for operation in pending:
-                operation()
-
-        return active_region()
+        with _defer_communication_initializers(), _primary_memory_saver.region(
+            tag=tag or "default", enable_cpu_backup=enable_cpu_backup
+        ):
+            yield
 
     def cuda_graph(self, graph, *, pool, stream, tag: str):
         # Requires the library's preload hook mode, which configure_subprocess
@@ -134,6 +148,14 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
 
     def cuda_graph(self, graph, *, pool, stream, tag: str):
         return torch.cuda.graph(graph, pool=pool, stream=stream)
+
+    def npu_graph(self, graph, *, pool, stream, tag: str, auto_dispatch_capture: bool):
+        return torch.npu.graph(
+            graph,
+            pool=pool,
+            stream=stream,
+            auto_dispatch_capture=auto_dispatch_capture,
+        )
 
     def pause(self, tag: str | None = None):
         pass

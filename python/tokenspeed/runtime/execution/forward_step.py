@@ -346,7 +346,7 @@ class ForwardStepRunner:
         # Decode graphs capture into the memory saver's ``cuda_graph`` region
         # so a sleep release can free their pool (a no-op adapter otherwise).
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=config.enable_memory_saver
+            enable=config.enable_memory_saver, device=self.device
         )
         self.gpu_id = config.gpu_id
         self.global_rank = config.global_rank
@@ -780,10 +780,11 @@ class ForwardStepRunner:
         _is_capture_mode = True
         global global_graph_memory_pool
         if self.device == "npu":
-            graph_capture = self.device_module.graph(
+            graph_capture = self.memory_saver_adapter.npu_graph(
                 graph,
                 pool=global_graph_memory_pool,
                 stream=self.stream,
+                tag="cuda_graph",
                 auto_dispatch_capture=True,
             )
         else:

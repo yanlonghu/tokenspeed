@@ -30,8 +30,8 @@ cache:
 - ``weights``: model parameters (CPU backup, or discard until a complete
   replica-committed update; frozen draft allocations retain CPU backup);
 - ``kv_cache``: the cache arena (discarded; zeroed on resume);
-- ``cuda_graph``: the decode CUDA graph memory pool (discarded; every replay
-  rewrites it before reading);
+- ``cuda_graph``: the decode graph memory pool (discarded and rewritten by
+  replay on CUDA; backed up and restored on Ascend);
 - ``nccl``: NCCL communicator buffers (suspended and resumed in place); only
   on an engine whose NCCL can suspend a communicator.
 """

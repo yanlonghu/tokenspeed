@@ -1,0 +1,13 @@
+--- a/python/tokenspeed/runtime/utils/ascend_memory_saver_state.py
++++ b/python/tokenspeed/runtime/utils/ascend_memory_saver_state.py
+@@ -138,8 +138,8 @@
+     model_update_config: str | None,
+ ) -> None:
+     """Validate the single-rank deployment supported by this adapter."""
+-    if world_size != 1 or disaggregation_mode != "null":
+-        raise ValueError("Ascend memory saver requires one rank and no PD")
++    if world_size not in (1, 2, 4, 8) or disaggregation_mode != "null":
++        raise ValueError("Diagnostic saver requires 1, 2, 4 or 8 ranks and no PD")
+     if speculative_algorithm is not None:
+         raise ValueError("Ascend memory saver does not support speculative decoding")
+     if weight_policy != "cpu_backup":

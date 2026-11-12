@@ -187,6 +187,9 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.attention.registry import AttentionBuild
     from tokenspeed.runtime.utils.server_args import ServerArgs
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
 
 
 @dataclass(frozen=True)
@@ -394,11 +397,13 @@ class DeviceHandle:
         host_cache_executor=None,
         kv_transfer=None,
         weight_memory: WeightMemoryState | None = None,
+        memory_saver: TorchMemorySaverAdapter | None = None,
         forward_reloader: ForwardReloader | None = None,
     ) -> None:
         # Private by convention AND by absence: nothing below returns it.
         self._executor = executor
         self._weight_memory = weight_memory
+        self._memory_saver = memory_saver
         # Development only (--allow-reload-forward); None refuses reload_forward.
         self._forward_reloader = forward_reloader
         # Resolved here, on the building thread, whose current device the
@@ -504,6 +509,8 @@ class DeviceHandle:
             copy event, or None on rounds that run no batch — DP-idle, an
             empty plan, or a D-role round whose only work was the peer's.
         """
+        if self._memory_saver is not None:
+            self._memory_saver.assert_active()
         if planned is not None and self._weight_memory is not None:
             self._weight_memory.require_usable()
         cache_ops = tuple(cache_ops)
@@ -711,6 +718,8 @@ class DeviceHandle:
         Args:
             dp_metadata: The round's CPU-gathered DP metadata.
         """
+        if self._memory_saver is not None:
+            self._memory_saver.assert_active()
         if self._weight_memory is not None:
             self._weight_memory.require_usable()
         self.settle()
@@ -821,6 +830,9 @@ class DeviceHandle:
         """
         self.settle()
         self._executor.token_to_kv_pool.clear_kv_buffers()
+        if self._memory_saver is not None:
+            # Ascend wake reports success only after queued KV zeros complete.
+            self._executor.device_module.synchronize()
         if self._kv_transfer is not None:
             self._kv_transfer.restore_cache_registration()
         if self._weight_memory is not None:
@@ -987,6 +999,14 @@ class DeviceHandle:
             UpdateWeightsFromMooncakeReqInput,
         ):
             raise TypeError(f"unsupported weight-load request {type(req).__name__}")
+        if (
+            self._memory_saver is not None
+            and type(req) is not UpdateWeightFromDiskReqInput
+        ):
+            return (
+                False,
+                "Ascend memory saver supports in-place weight updates from disk",
+            )
         state = self._weight_memory
         if state is None:
             return True, "ready for weight update"
@@ -1054,6 +1074,11 @@ class DeviceHandle:
             UpdateWeightsFromMooncakeReqInput,
             UpdateWeightFromDiskReqInput,
         )
+        if self._memory_saver is not None and not loads_weights:
+            return (
+                False,
+                "Ascend memory saver supports in-place weight updates from disk",
+            )
 
         state = self._weight_memory
         require_complete = False
@@ -1887,6 +1912,11 @@ def build_device_side(
             host_cache_executor=host_cache_executor,
             kv_transfer=kv_transfer,
             weight_memory=weight_memory,
+            memory_saver=(
+                target.memory_saver_adapter
+                if server_args.enable_memory_saver and executor.device == "npu"
+                else None
+            ),
             forward_reloader=(
                 _forward_reloader(server_args, global_rank)
                 if server_args.allow_reload_forward

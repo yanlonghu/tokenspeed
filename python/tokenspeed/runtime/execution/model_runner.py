@@ -205,7 +205,7 @@ class ModelRunner:
         initialize_moe_config(server_args)
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver
+            enable=server_args.enable_memory_saver, device=self.device
         )
         # The target's expert placement (redundant replicas, load counters) is
         # process-global so its model picks it up while it is built and loaded.
@@ -646,7 +646,9 @@ class ModelRunner:
                     f"the KV-cache scales loaded at startup ({consumed} checkpoint "
                     "tensors had reached the model)"
                 )
-            if self.device != "cpu":
+            if self.device == "npu":
+                torch.npu.synchronize(self.gpu_id)
+            elif self.device != "cpu":
                 torch.cuda.synchronize(torch.device(f"cuda:{self.gpu_id}"))
         except Exception as e:  # noqa: BLE001 - surface to the control plane
             logger.exception("update_weights_from_disk failed")

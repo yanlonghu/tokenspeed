@@ -36,6 +36,8 @@ owns Python log cleanup explicitly after serving returns, including errors
 and encode ranks, before notifying its launcher of a failure. Returning from
 Rust does not finalize Python, so an `atexit` hook alone cannot drain those
 records. Cleanup is bounded because an output stream can remain stalled.
+For Ascend ranks, the launcher asks the host to restore the main thread's GIL
+after log cleanup so Triton-Ascend's native exit handlers can run.
 
 The ranks of a replica (an attention-TP group, across every pipeline stage)
 run the same scheduler. They talk over `ts-collective`'s TCP mesh, in fixed

@@ -78,7 +78,7 @@ def memory(monkeypatch):
 
 
 def test_native_storage_initializes_after_weight_region_and_survives_discard(memory):
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     communication = []
     with saver.region(tag="weights", enable_cpu_backup=False):
         weight = memory.allocate(5)
@@ -93,7 +93,7 @@ def test_native_storage_initializes_after_weight_region_and_survives_discard(mem
 
 
 def test_multiple_preparations_finish_before_region_returns(memory):
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     outputs = []
     with saver.region(tag="weights", enable_cpu_backup=False):
         for value in (3, 5, 7):
@@ -106,7 +106,7 @@ def test_multiple_preparations_finish_before_region_returns(memory):
 
 
 def test_failed_weight_load_does_not_initialize_communication(memory):
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     outputs = []
     with pytest.raises(RuntimeError, match="load failed"):
         with saver.region(tag="weights", enable_cpu_backup=False):
@@ -120,7 +120,7 @@ def test_failed_weight_load_does_not_initialize_communication(memory):
 
 
 def test_preparation_failure_fails_loading_after_managed_scope_exits(memory):
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
 
     def fail():
         assert not memory.active
@@ -133,7 +133,7 @@ def test_preparation_failure_fails_loading_after_managed_scope_exits(memory):
 
 
 def test_disabled_adapter_initializes_communication_immediately(memory):
-    saver = adapter.TorchMemorySaverAdapter.create(enable=False)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=False, device="cuda")
     outputs = []
     with saver.region(tag="weights", enable_cpu_backup=False):
         adapter.initialize_communication(lambda: outputs.append(memory.allocate(23)))
