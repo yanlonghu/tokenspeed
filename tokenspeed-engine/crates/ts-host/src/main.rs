@@ -24,7 +24,7 @@
 //! half; `TOKENSPEED_HOST_BINARY` overrides the installed binary):
 //!
 //! ```text
-//! ts-host --python <executable> --control-fd <fd> --enable-async-logging <bool>
+//! ts-host --python <executable> --control-fd <fd> --enable-async-logging <bool> [--restore-gil-for-exit <bool>]
 //! ```
 //!
 //! The rank's arguments arrive on `--control-fd`, and readiness goes back
@@ -98,7 +98,7 @@ const EP_GROUP: u32 = 3;
 #[derive(Debug, thiserror::Error)]
 enum HostError {
     #[error(
-        "usage: ts-host --python <executable> --control-fd <fd> --enable-async-logging <bool>: {0}"
+        "usage: ts-host --python <executable> --control-fd <fd> --enable-async-logging <bool> [--restore-gil-for-exit <bool>]: {0}"
     )]
     Usage(String),
     #[error("{0}")]
@@ -137,6 +137,7 @@ struct Args {
     python: String,
     control_fd: i32,
     enable_async_logging: bool,
+    restore_gil_for_exit: bool,
 }
 
 /// The control and forward threads report to the same launcher.
@@ -209,6 +210,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, HostError>
     let mut python = None;
     let mut control_fd = None;
     let mut enable_async_logging = None;
+    let mut restore_gil_for_exit = false;
     while let Some(flag) = args.next() {
         let value = args
             .next()
@@ -229,6 +231,13 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, HostError>
                     ))
                 })?);
             }
+            "--restore-gil-for-exit" => {
+                restore_gil_for_exit = value.parse().map_err(|_| {
+                    HostError::Usage(format!(
+                        "bad --restore-gil-for-exit {value}: use true or false"
+                    ))
+                })?;
+            }
             _ => return Err(HostError::Usage(format!("unknown argument {flag}"))),
         }
     }
@@ -238,6 +247,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, HostError>
             .ok_or_else(|| HostError::Usage("--control-fd is required".to_owned()))?,
         enable_async_logging: enable_async_logging
             .ok_or_else(|| HostError::Usage("--enable-async-logging is required".to_owned()))?,
+        restore_gil_for_exit,
     })
 }
 
@@ -964,16 +974,22 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let _log_guard = logging::init(args.enable_async_logging);
+    let log_guard = logging::init(args.enable_async_logging);
     let launcher = LAUNCHER_FAILURE.get_or_init(LauncherFailure::for_parent);
-    let served = (|| {
-        interpreter::start(&args.python).map_err(HostError::Interpreter)?;
+    let main_thread = match interpreter::start(&args.python) {
+        Ok(state) => state,
+        Err(error) => {
+            launcher.report(HostError::Interpreter(error));
+            return ExitCode::FAILURE;
+        }
+    };
+    let served = {
         // The host does not finalize Python. Drain its logger on success,
         // error and unwind if the launcher has not stopped the rank.
         let _python_logs = logging::PythonLogGuard;
         serve(&args, launcher)
-    })();
-    match served {
+    };
+    let exit_code = match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             // Errors outside generation serving still arrive after cleanup,
@@ -981,8 +997,18 @@ fn main() -> ExitCode {
             launcher.report(&error);
             ExitCode::FAILURE
         }
+    };
+    drop(log_guard);
+    if args.restore_gil_for_exit {
+        // Triton-Ascend's native exit handlers access Python on this thread.
+        main_thread.restore_for_exit();
     }
+    exit_code
 }
+
+#[cfg(test)]
+#[path = "../tests/support/restore_gil_for_exit.rs"]
+mod restore_gil_for_exit_tests;
 
 #[cfg(test)]
 #[path = "tests/main.rs"]

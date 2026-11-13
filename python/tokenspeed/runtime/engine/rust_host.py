@@ -312,20 +312,25 @@ def start_rust_host(
         }.get(level, level),
     )
     with start_context:
+        command = [
+            (
+                f"tokenspeed::encode_tp{server_args.mapping.attn.tp_rank}"
+                if server_args.disaggregation_mode == "encode"
+                else rank_process_title(server_args.mapping)
+            ),
+            "--python",
+            sys.executable,
+            "--control-fd",
+            str(child.fileno()),
+            "--enable-async-logging",
+            str(server_args.enable_async_logging).lower(),
+        ]
+        if server_args.device == "npu":
+            # Triton-Ascend's native exit handlers can release Python objects
+            # during libc exit, including when the memory saver is disabled.
+            command.extend(["--restore-gil-for-exit", "true"])
         popen = subprocess.Popen(
-            [
-                (
-                    f"tokenspeed::encode_tp{server_args.mapping.attn.tp_rank}"
-                    if server_args.disaggregation_mode == "encode"
-                    else rank_process_title(server_args.mapping)
-                ),
-                "--python",
-                sys.executable,
-                "--control-fd",
-                str(child.fileno()),
-                "--enable-async-logging",
-                str(server_args.enable_async_logging).lower(),
-            ],
+            command,
             executable=binary,
             env=host_env,
             pass_fds=[child.fileno(), held_until_exit],
