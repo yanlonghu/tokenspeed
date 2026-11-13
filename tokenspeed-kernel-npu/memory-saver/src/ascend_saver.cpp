@@ -232,15 +232,18 @@ public:
       b.contents_valid = true; // malloc semantics: uninitialized, but usable.
       b.phase = Phase::Active;
       return b.va;
-    } catch (const std::exception &e) {
-      const std::string original = e.what();
+    } catch (const std::exception &allocation) {
       try {
         release_block(b);
         blocks.erase(it);
       } catch (const std::exception &cleanup) {
-        throw std::runtime_error(original + "; cleanup retained for saver_collect_failed: " + cleanup.what());
+        char error[sizeof(callback_error)];
+        std::snprintf(error, sizeof(error),
+                      "%s; allocation rollback failed: %s", allocation.what(), cleanup.what());
+        latch_callback_fault(error);
+        throw std::runtime_error(error);
       }
-      throw std::runtime_error(original);
+      throw;
     }
   }
 

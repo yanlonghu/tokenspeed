@@ -25,7 +25,8 @@ extern "C" {
  * fences rather than inserting stream-order dependencies.
  */
 SAVER_API int saver_abi_version(void);
-/* Sticky first void-free callback fault: 1 means restart worker before reuse.
+/* Sticky first callback fault from a void free or failed allocation rollback.
+ * A return value of 1 means restart the worker before reuse.
  * Allocation/pause/resume fail closed. Explicit release/cleanup remain allowed.
  */
 SAVER_API int saver_has_callback_fault(void);

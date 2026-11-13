@@ -144,13 +144,34 @@ void allocation_failure_cleanup() {
     REQUIRE(weights_malloc(42, 0, nullptr) == nullptr);
     REQUIRE(std::strlen(saver_last_error()) != 0);
     REQUIRE(fake_acl::live_reservations() == 0 && fake_acl::live_physical() == 0);
+    REQUIRE(saver_has_callback_fault() == 0);
+    void *retry = weights_malloc(42, 0, nullptr); REQUIRE(retry);
+    ok(saver_release(retry));
   }
+}
+
+void allocation_rollback_fault_is_terminal() {
   reset();
-  fake_acl::fail_next("aclrtMapMem"); fake_acl::fail_next("aclrtFreePhysical");
+  void *kv = kv_malloc(42, 0, nullptr); REQUIRE(kv);
+  fake_acl::fail_next("aclrtMapMem");
+  fake_acl::fail_next("aclrtFreePhysical");
   REQUIRE(weights_malloc(42, 0, nullptr) == nullptr);
+  const std::string error = saver_last_error();
+  REQUIRE(error.find("aclrtMapMem failed") != std::string::npos);
+  REQUIRE(error.find("allocation rollback failed: aclrtFreePhysical failed") != std::string::npos);
+  REQUIRE(saver_has_callback_fault() == 1);
   REQUIRE(stat_has("\"releasing_segments\":1"));
-  REQUIRE(fake_acl::live_reservations() == 1 && fake_acl::live_physical() == 1);
+  REQUIRE(fake_acl::live_reservations() == 2 && fake_acl::live_physical() == 2);
+  const auto reserves = fake_acl::calls("aclrtReserveMemAddress");
+  REQUIRE(weights_malloc(42, 0, nullptr) == nullptr);
+  REQUIRE(fake_acl::calls("aclrtReserveMemAddress") == reserves);
+  REQUIRE(saver_pause("kv_cache") != 0);
+  REQUIRE(saver_resume("kv_cache") != 0);
+  REQUIRE(stat_has("\"active_segments\":1"));
+  ok(saver_release(kv));
   ok(saver_collect_failed());
+  REQUIRE(saver_has_callback_fault() == 1);
+  REQUIRE(stat_has("\"callback_error\":\"" + error + "\""));
   REQUIRE(fake_acl::live_reservations() == 0 && fake_acl::live_physical() == 0);
 }
 
@@ -279,9 +300,13 @@ int main(int argc, char **argv) {
   try {
     if (argc == 2) {
       const std::string scenario = argv[1];
-      REQUIRE(scenario == "wrong-context" || scenario == "wrong-device");
-      callback_retires_before_validation(scenario == "wrong-context");
-      std::cout << "PASS: void free " << scenario << " is terminal and cleanup released all resources\n";
+      if (scenario == "malloc-rollback") {
+        allocation_rollback_fault_is_terminal();
+      } else {
+        REQUIRE(scenario == "wrong-context" || scenario == "wrong-device");
+        callback_retires_before_validation(scenario == "wrong-context");
+      }
+      std::cout << "PASS: " << scenario << " fault is terminal and cleanup released all resources\n";
       return 0;
     }
     REQUIRE(argc == 1);

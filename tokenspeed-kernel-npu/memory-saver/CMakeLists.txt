@@ -17,6 +17,7 @@ if(SAVER_FAKE_ACL)
   # Each callback fault is terminal for its process.
   add_test(NAME saver_void_free_wrong_context COMMAND ${saver_target} wrong-context)
   add_test(NAME saver_void_free_wrong_device COMMAND ${saver_target} wrong-device)
+  add_test(NAME saver_failed_malloc_rollback COMMAND ${saver_target} malloc-rollback)
 else()
   set(saver_target ascend_memory_saver)
   add_library(${saver_target} SHARED src/ascend_saver.cpp)

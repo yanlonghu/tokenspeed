@@ -91,6 +91,13 @@ running from source and the installed executable is from another checkout.
 The saver library must provide ABI 2.
 [Allocator requirements](../../tokenspeed-kernel-npu/memory-saver/README.md)
 
+Leave `PYTORCH_NO_NPU_MEMORY_CACHING` unset or set it to `0`. Disabling the
+PTA caching allocator bypasses the managed MemPools and is rejected at startup.
+Startup also checks that target and draft parameters, the shared KV backing,
+and captured graph allocations belong to their live managed pools. An
+allocation failure with a failed rollback faults the worker. Restart it rather
+than retrying a partially cleaned-up allocation.
+
 ## Start a worker
 
 The example runs a dense BF16 Qwen3 model on one NPU. Set `CHECKPOINT_A`
@@ -114,6 +121,9 @@ The graph tag is `acl_graph`. An audited BF16 MHA decode capture with greedy
 sampling can discard temporary graph pages. Other supported captures back up
 the graph pool on the host. The runtime selects this graph policy from the
 model and capture configuration. The weight policy flag controls weights.
+Releasing `acl_graph` also releases `kv_cache`, including target and draft KV
+in the shared device arena. Resume the graph pool first and wake KV explicitly
+when weights are ready. This pairing also applies to graph-pool CPU backup.
 [Server options](../configuration/server.md)
 
 | Tag | Released memory | How it becomes ready |
@@ -164,6 +174,19 @@ rl() {
    of the same dense BF16 Qwen3 architecture and a path visible to every
    worker. This request lets the direct checkpoint loader detect the file
    format and sets a cache namespace version.
+   Ascend Memory Saver requires `flush_cache=true` for weight updates. Before
+   loading any rank, TokenSpeed clears Host L2 and deletes old L3 namespace
+   objects. A refusal leaves the update unapplied and can be retried.
+
+   Publish each checkpoint in an immutable version directory. For `auto`, keep
+   one selectable inference file family there: a folder containing both
+   Safetensors and binary weights is refused. An explicit format can select
+   the intended family. Direct readers `auto`, `safetensors`, `pt`, and
+   `mistral` are supported within the existing model contract. NPCACHE,
+   InstantTensor, dummy and custom loaders are rejected for Ascend Saver
+   updates under both weight policies. These format checks run before cache
+   invalidation and the weight transaction, so correcting the request permits
+   a retry with the same version. Do not modify files during a reload.
 
    ```bash
    rl update_weights_from_disk \
@@ -178,12 +201,31 @@ rl() {
    ```
 
 With `cpu_backup`, omit step 3 when you want to serve the original weights.
+Device KV is still discarded during graph suspend and rebuilt on wake, even
+when the weight version stays the same. Host prefixes can be reused for the
+same weights until a weight update flushes them.
 With `discard`, always send explicit tags during wake so KV stays released
 until the new weights are committed. A sequencing refusal before work starts
 can be retried in the correct order. If the weight load starts and then fails,
 or a device memory transition fails, restart the worker before submitting
 new requests.
 [Weight update contract](weight-memory.md)
+
+### Causal attention in a captured draft
+
+FIA causal masking works for multi-query verification. For example, five
+queries over 105 KV positions use suffix-causal bounds 100 through 104.
+Query row 1 cannot attend positions 102 through 104. After narrowing that
+row into a single-query draft call, the native wrapper supplies no mask or
+absolute query position. It must receive the correct KV frontier, 102 in
+this example, or an explicit position mask. A KV length of 105 by itself
+does not preserve the original row's causal boundary.
+
+Automatic native draft MHA capture uses Triton to consume the lengths
+computed on device inside the graph. Draft overlap remains enabled. Avoid
+forcing `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_MHA_DECODE_WITH_KVCACHE` to
+`torch_npu_mha_decode_with_kvcache` for this captured narrowed-draft path.
+See the [causal-length control results](ascend-memory-saver-test-report.md#fia-causal-length-controls).
 
 ## Load a published Mooncake version
 

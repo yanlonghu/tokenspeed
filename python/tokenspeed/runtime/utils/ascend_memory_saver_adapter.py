@@ -23,6 +23,7 @@
 import ctypes
 import json
 import os
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from threading import RLock
@@ -39,6 +40,14 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
     TorchMemorySaverAdapter,
     _defer_communication_initializers,
 )
+
+
+def _check_caching_allocator() -> None:
+    if os.environ.get("PYTORCH_NO_NPU_MEMORY_CACHING", "").strip() == "1":
+        raise RuntimeError(
+            "Ascend memory saver requires PYTORCH_NO_NPU_MEMORY_CACHING=0 "
+            "or unset so managed MemPools receive allocations"
+        )
 
 
 def _library_path() -> str:
@@ -99,6 +108,7 @@ class NativeBackend:
 
 class DeviceState:
     def __init__(self, device: int):
+        _check_caching_allocator()
         # Import only in the worker, after its device has been selected.
         try:
             from torch_npu.npu import memory
@@ -174,6 +184,7 @@ class AscendMemorySaverAdapter(TorchMemorySaverAdapter):
 
     @contextmanager
     def configure_subprocess(self):
+        _check_caching_allocator()
         _library_path()
         yield
 
@@ -230,6 +241,88 @@ class AscendMemorySaverAdapter(TorchMemorySaverAdapter):
 
     def assert_active(self):
         self._state().state.assert_active()
+
+    def validate_startup(
+        self,
+        *,
+        models: Sequence[tuple[str, torch.nn.Module]],
+        kv_regions: Mapping[str, torch.Tensor],
+        graphs: Iterable,
+    ) -> None:
+        """Check named models, cache backing regions and captured graph pools.
+
+        NPU storage must belong to a live VMM segment with its release tag.
+        ``graphs`` is empty for eager startup. Raises RuntimeError on bypass.
+        """
+        state = self._state()
+        state.synchronize()
+        state.native.check_health()
+        blocks = state.native.stats()["blocks"]
+
+        def require_managed(tag: str, name: str, pointer: int, size: int) -> None:
+            for block in blocks:
+                base = int(block["ptr"], 16)
+                if (
+                    block["tag"] == tag
+                    and block["device"] == state.device
+                    and block["phase"] == "active"
+                    and block["reserved"]
+                    and block["physical_live"]
+                    and block["mapped"]
+                    and block["contents_valid"]
+                    and base <= pointer
+                    and pointer + size <= base + block["aligned_bytes"]
+                ):
+                    return
+            raise RuntimeError(
+                f"Ascend memory saver {tag} storage {name!r} at "
+                f"{pointer:#x} ({size} bytes) bypassed its live managed pool"
+            )
+
+        for role, model in models:
+            found = False
+            for name, tensor in model.named_parameters():
+                if tensor.device.type != "npu" or not tensor.numel():
+                    continue
+                # Storage bounds cover tied, offset and noncontiguous views.
+                storage = tensor.untyped_storage()
+                require_managed(
+                    "weights", f"{role}.{name}", storage.data_ptr(), storage.nbytes()
+                )
+                found = True
+            if not found:
+                raise RuntimeError(
+                    f"Ascend memory saver found no NPU weights for {role}"
+                )
+
+        found = False
+        for name, tensor in kv_regions.items():
+            if tensor.device.type != "npu" or not tensor.numel():
+                continue
+            storage = tensor.untyped_storage()
+            require_managed("kv_cache", name, storage.data_ptr(), storage.nbytes())
+            found = True
+        if not found:
+            raise RuntimeError("Ascend memory saver found no NPU KV backing")
+
+        graph_pools = {graph.pool() for graph in graphs}
+        if graph_pools:
+            owned = {
+                pool.pool.id
+                for key, pool in state.state.pools.items()
+                if key.tag == "acl_graph"
+            }
+            if not graph_pools <= owned:
+                raise RuntimeError("ACL Graph capture bypassed its owned managed pool")
+            # PTA retains graph scratch in its pool after Python tensors die.
+            for segment in torch.npu.memory_snapshot():
+                pool = tuple(segment["segment_pool_id"])
+                if segment["device"] != state.device or pool not in graph_pools:
+                    continue
+                require_managed(
+                    "acl_graph", str(pool), segment["address"], segment["total_size"]
+                )
+        state.native.check_health()
 
     def stats(self):
         return self._state().native.stats()

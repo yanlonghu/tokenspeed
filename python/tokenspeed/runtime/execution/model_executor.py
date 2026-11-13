@@ -1209,6 +1209,16 @@ class ModelExecutor:
                     observer=observer,
                 )
 
+        if self.device == "npu" and self.config.enable_memory_saver:
+            models = [("target", self.model_runner.model)]
+            if self._draft_model_runner is not None:
+                models.append(("draft", self._draft_model_runner.model))
+            self.model_runner.memory_saver_adapter.validate_startup(
+                models=models,
+                kv_regions=self.token_to_kv_pool.arena.regions,
+                graphs=self.forward_step.graphs.values(),
+            )
+
     @property
     def captures_drafter_prefill_graph(self) -> bool:
         """Whether this boot records a drafter prefill graph beside the ladders.

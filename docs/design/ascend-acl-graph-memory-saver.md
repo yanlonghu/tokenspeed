@@ -102,17 +102,27 @@ against a fresh worker, and checks that the graph pool used zero backup bytes.
    On Ascend the coordination group is the single-node TP replica. The
    native saver releases the local allocations for each requested tag and
    preserves their virtual addresses. The release of `kv_cache` discards
-   device pages after the scheduler clears its L1 index.
+   device pages after the scheduler clears its L1 index. Releasing `acl_graph`
+   also selects resident `kv_cache`, for either graph-pool policy. Target and
+   draft share this device arena. Graph-only wake leaves KV asleep.
 2. The trainer publishes the next checkpoint. Resume `weights` and
    `acl_graph`, while `kv_cache` remains released. Device addresses are valid
    again. Discarded weights still require a checkpoint.
 3. Load a complete target checkpoint from disk or through the Model Updater
-   SDK. The SDK also supports an eligible independent draft in the same
+   SDK. Ascend updates require `flush_cache=true`: the host deletes the old L3
+   namespace and clears L1/L2 before dispatching parameter writes. The SDK also
+   supports an eligible independent draft in the same
    version. Every rank verifies required source names and source tensor
    shapes. The loaders shard and fuse weights into their current storage.
    All ranks agree that coverage passed before any model rebuilds
    weight-derived state. The replica commits after all ranks finish and
    any requested cache namespace change succeeds.
+
+   Disk admission rejects cached or non-direct readers and mixed AUTO file
+   families before cache invalidation or a weight transaction. A format
+   refusal preserves the existing state for a corrected request. The caller
+   publishes immutable checkpoint directories; this check does not snapshot
+   files or prevent external writers from changing them during a load.
 4. Resume `kv_cache`. Each rank clears its arena and completes wake. The
    scheduler can then dispatch new work using the original ACL Graph.
 
@@ -129,6 +139,7 @@ keeps the replica unavailable. The launcher supervises fatal rank failures.
 | Enable | `--enable-memory-saver` and `--weight-memory-policy` with `cpu_backup` or `discard` | Same flags. Use a matching `ts-host`, supported PTA build, and the Ascend saver library. |
 | Release or resume | `release_memory_occupation` and `resume_memory_occupation` | Same calls and optional `tags`. The SMG direct gateway exposes them under `/v1/rl` with `--enable-rl`. |
 | Select managed memory | `kv_cache`, `weights`, `cuda_graph`, and optional `nccl` | `kv_cache`, `weights`, and `acl_graph`. HCCL and its communication workspaces stay resident. |
+| KV on graph sleep | Follows the requested release tags. | `acl_graph` release also discards device KV. Graph-only wake keeps KV asleep until its explicit wake. |
 | Recover captured execution | Remap at the original addresses and replay the original CUDA Graph. | Remap at the original addresses and replay the original ACL Graph. Audited pools discard and recreate temporary bytes. Other supported pools restore them from host. |
 | Replace discarded target weights | `update_weights_from_mooncake` via a configured Model Updater SDK. | Same SDK request, or `update_weights_from_disk` for a complete eligible target checkpoint. |
 | Receive trainer broadcasts | The NCCL update group can stream compatible updates when weights use CPU backup. | Use disk or the Model Updater SDK with Ascend Memory Saver. |

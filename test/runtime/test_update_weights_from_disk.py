@@ -152,13 +152,29 @@ _Q_PROJ = "model.layers.0.self_attn.q_proj.weight"
 
 def _write_qwen3_checkpoint(directory, tensors, file_format):
     directory.mkdir()
-    if file_format == "bin":
-        torch.save(tensors, directory / "pytorch_model.bin")
+    if file_format in ("bin", "pt"):
+        torch.save(tensors, directory / f"pytorch_model.{file_format}")
     else:
         save_file(tensors, str(directory / "model.safetensors"))
 
 
-@pytest.mark.parametrize("file_format", ["safetensors", "bin"])
+def _ascend_saver_handle(model, startup, policy, monkeypatch):
+    runner = _runner(model, startup)
+    runner.device = "npu"
+    monkeypatch.setattr(
+        torch, "npu", SimpleNamespace(synchronize=lambda _: None), raising=False
+    )
+    # Only device capability and synchronization need an accelerator here.
+    with mock.patch.object(type(model), "supports_weight_discard", True):
+        state = WeightMemoryState(policy=policy, models=[model])
+    state.mark_kv_released()
+    executor = _device_handle(runner)._executor
+    executor.device = "cpu"
+    handle = AscendMemorySaverDeviceHandle(executor, weight_memory=state)
+    return handle, runner, state
+
+
+@pytest.mark.parametrize("file_format", ["safetensors", "bin", "pt"])
 def test_ascend_complete_disk_reload_checks_global_shape_without_startup_header(
     tmp_path, monkeypatch, file_format
 ):
@@ -193,7 +209,10 @@ def test_ascend_complete_disk_reload_checks_global_shape_without_startup_header(
     invalid = tmp_path / "oversized"
     _write_qwen3_checkpoint(invalid, oversized, file_format)
     ok, message = runner.update_weights_from_disk(
-        UpdateWeightFromDiskReqInput(model_path=str(invalid)), require_complete=True
+        UpdateWeightFromDiskReqInput(
+            model_path=str(invalid), load_format="pt" if file_format == "pt" else None
+        ),
+        require_complete=True,
     )
     assert (
         not ok and "before TP slicing" in message and "nothing was written" in message
@@ -204,7 +223,10 @@ def test_ascend_complete_disk_reload_checks_global_shape_without_startup_header(
     valid = tmp_path / "valid"
     _write_qwen3_checkpoint(valid, update, file_format)
     ok, message = runner.update_weights_from_disk(
-        UpdateWeightFromDiskReqInput(model_path=str(valid)), require_complete=True
+        UpdateWeightFromDiskReqInput(
+            model_path=str(valid), load_format="pt" if file_format == "pt" else None
+        ),
+        require_complete=True,
     )
     assert ok, message
     assert runner.model_config.model_path == str(valid)
@@ -249,7 +271,162 @@ def test_ascend_complete_disk_reload_refuses_stale_npcache(tmp_path, monkeypatch
         torch.testing.assert_close(parameter, previous)
 
 
-def _check_disk_refusal_on_rank(rank, root):
+@pytest.mark.parametrize("policy", ["cpu_backup", "discard"])
+@pytest.mark.parametrize(
+    "load_format", ["npcache", "instanttensor", "dummy", "sharded_state", "extensible"]
+)
+def test_ascend_saver_rejects_disk_reader_before_transaction_and_accepts_retry(
+    tmp_path, monkeypatch, policy, load_format
+):
+    model = make_qwen3_model(tied=True)
+    source = qwen3_checkpoint()
+    model.load_weights(source.items())
+    before = [parameter.detach().clone() for parameter in model.parameters()]
+    startup = tmp_path / "startup"
+    update = tmp_path / "update"
+    _write_qwen3_checkpoint(
+        update, {name: value * 2 for name, value in source.items()}, "bin"
+    )
+    handle, runner, state = _ascend_saver_handle(model, startup, policy, monkeypatch)
+    request = UpdateWeightFromDiskReqInput(
+        model_path=str(update), load_format=load_format, weight_version="step-2"
+    )
+    ready, message = handle.check_weight_update(request)
+    assert not ready and f"load_format {load_format!r} is unsupported" in message
+    ok, message = handle.update_weights(request)
+    assert not ok and "nothing was written" in message
+    assert state.valid and not state.failed and not state.updating
+    assert state.local_update_success is None
+    assert runner.model_config.model_path == str(startup)
+    for parameter, previous in zip(model.parameters(), before, strict=True):
+        torch.testing.assert_close(parameter, previous)
+
+    # The same version remains admissible after fixing the request format.
+    request.load_format = "auto"
+    assert handle.check_weight_update(request)[0]
+    ok, message = handle.update_weights(request)
+    assert ok, message
+    handle.commit_weight_update(True)
+    assert state.valid and not state.failed and not state.updating
+    for parameter, previous in zip(model.parameters(), before, strict=True):
+        torch.testing.assert_close(parameter, previous * 2)
+
+
+def test_ascend_saver_refuses_custom_startup_disk_loader(tmp_path, monkeypatch):
+    model = make_qwen3_model(tied=True)
+    handle, runner, state = _ascend_saver_handle(
+        model, tmp_path, "cpu_backup", monkeypatch
+    )
+    runner.server_args.load_format = loader_module.DefaultModelLoader
+    ready, message = handle.check_weight_update(
+        UpdateWeightFromDiskReqInput(model_path=str(tmp_path))
+    )
+    assert not ready and "unsupported" in message
+    assert state.valid and not state.failed and not state.updating
+
+
+@pytest.mark.parametrize("policy", ["cpu_backup", "discard"])
+@pytest.mark.parametrize("other_format", ["bin", "pt"])
+def test_ascend_saver_refuses_mixed_auto_and_accepts_explicit_format(
+    tmp_path, monkeypatch, policy, other_format
+):
+    model = make_qwen3_model(tied=True)
+    source = qwen3_checkpoint()
+    model.load_weights(source.items())
+    before = [parameter.detach().clone() for parameter in model.parameters()]
+    update = tmp_path / "update"
+    _write_qwen3_checkpoint(update, source, "safetensors")
+    torch.save(
+        {name: value * 2 for name, value in source.items()},
+        update / f"pytorch_model.{other_format}",
+    )
+    # Safetensors index selection still applies when examining the family.
+    (update / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": dict.fromkeys(source, "model.safetensors")})
+    )
+    monkeypatch.setattr(
+        type(model), "fall_back_to_pt_during_load", other_format == "pt", raising=False
+    )
+    handle, runner, state = _ascend_saver_handle(model, tmp_path, policy, monkeypatch)
+    request = UpdateWeightFromDiskReqInput(
+        model_path=str(update), weight_version="step-2"
+    )
+    ready, message = handle.check_weight_update(request)
+    assert not ready and "'auto' is ambiguous" in message
+    assert other_format in message and "immutable version directory" in message
+    ok, message = handle.update_weights(request)
+    assert not ok and state.valid and not state.failed and not state.updating
+    for parameter, previous in zip(model.parameters(), before, strict=True):
+        torch.testing.assert_close(parameter, previous)
+
+    request.load_format = "pt" if other_format == "pt" else "safetensors"
+    ok, message = handle.update_weights(request)
+    assert ok, message
+    handle.commit_weight_update(True)
+    for parameter, previous in zip(model.parameters(), before, strict=True):
+        torch.testing.assert_close(
+            parameter, previous * (2 if other_format == "pt" else 1)
+        )
+
+
+@pytest.mark.parametrize("policy", ["cpu_backup", "discard"])
+def test_ascend_saver_auto_ignores_training_files_and_inactive_pt(
+    tmp_path, monkeypatch, policy
+):
+    source = qwen3_checkpoint()
+    update = tmp_path / "update"
+    _write_qwen3_checkpoint(update, source, "safetensors")
+    for name in (
+        "training_args.bin",
+        "optimizer.bin",
+        "optimizer.pt",
+        "scheduler.pt",
+        "other.pt",
+    ):
+        torch.save({"unused": torch.zeros(1)}, update / name)
+    model = make_qwen3_model(tied=True)
+    handle, runner, state = _ascend_saver_handle(model, tmp_path, policy, monkeypatch)
+    ok, message = handle.update_weights(
+        UpdateWeightFromDiskReqInput(model_path=str(update))
+    )
+    assert ok, message
+    handle.commit_weight_update(True)
+    assert runner.model_config.model_path == str(update)
+    assert state.valid and not state.failed
+
+
+@pytest.mark.parametrize("policy", ["cpu_backup", "discard"])
+def test_ascend_saver_auto_rereads_replaced_bin_at_same_path(
+    tmp_path, monkeypatch, policy
+):
+    source = qwen3_checkpoint()
+    update = tmp_path / "update"
+    _write_qwen3_checkpoint(update, source, "bin")
+    # An index without matching shards is not another selectable family.
+    (update / "model.safetensors.index.json").write_text("unused index")
+    model = make_qwen3_model(tied=True)
+    handle, runner, state = _ascend_saver_handle(model, update, policy, monkeypatch)
+    loader = runner._disk_reload_loader("npcache")
+    list(loader.get_checkpoint_weights(str(update), None, model, runner.mapping))
+    torch.save(
+        {name: value * 2 for name, value in source.items()},
+        update / "pytorch_model.bin",
+    )
+    request = UpdateWeightFromDiskReqInput(
+        model_path=str(update), load_format="npcache"
+    )
+    assert not handle.update_weights(request)[0]
+    assert state.valid and not state.failed and not state.updating
+    request.load_format = "auto"
+    ok, message = handle.update_weights(request)
+    assert ok, message
+    handle.commit_weight_update(True)
+    torch.testing.assert_close(
+        model.model.embed_tokens.weight, source["model.embed_tokens.weight"] * 2
+    )
+
+
+def _check_disk_refusal_on_rank(rank, root, refuse_during_admission):
     root = Path(root)
     dist = torch.distributed
     dist.init_process_group(
@@ -281,12 +458,33 @@ def _check_disk_refusal_on_rank(rank, root):
             state = WeightMemoryState(policy="discard", models=[model])
         handle._weight_memory = state
         state.mark_kv_released()
+        request = UpdateWeightFromDiskReqInput(
+            model_path=str(root / f"rank-{rank}"), weight_version="step-2"
+        )
+        if refuse_during_admission:
+            # The host agrees these local checks before invalidating caches
+            # or dispatching the update to any rank.
+            ready, message = handle.check_weight_update(request)
+            admissions = [None, None]
+            dist.all_gather_object(admissions, ready)
+            assert admissions == [True, False]
+            assert state.valid and not state.failed and not state.updating
+            for parameter, previous in zip(model.parameters(), before, strict=True):
+                torch.testing.assert_close(parameter, previous)
+            # Correct the format using the same version and retry normally.
+            request.load_format = "safetensors"
+            assert handle.check_weight_update(request)[0]
         with mock.patch.object(
             torch, "npu", SimpleNamespace(synchronize=lambda _: None), create=True
         ):
-            ok, message = handle.update_weights(
-                UpdateWeightFromDiskReqInput(model_path=str(root / f"rank-{rank}"))
-            )
+            ok, message = handle.update_weights(request)
+        if refuse_during_admission:
+            assert ok, message
+            handle.commit_weight_update(True)
+            assert state.valid and not state.failed and not state.updating
+            for parameter, previous in zip(model.parameters(), before, strict=True):
+                torch.testing.assert_close(parameter, previous * 2)
+            return
         assert not ok and "Incomplete checkpoint" in message
         if rank == 0:
             assert "group rank 1" in message
@@ -309,7 +507,19 @@ def test_ascend_complete_disk_reload_agrees_before_any_rank_writes(tmp_path):
     del update[_Q_PROJ]
     _write_qwen3_checkpoint(tmp_path / "rank-1", update, "bin")
     torch.multiprocessing.spawn(
-        _check_disk_refusal_on_rank, args=(str(tmp_path),), nprocs=2
+        _check_disk_refusal_on_rank, args=(str(tmp_path), False), nprocs=2
+    )
+
+
+@pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo required")
+def test_ascend_disk_format_admission_refusal_leaves_every_rank_retryable(tmp_path):
+    (tmp_path / "startup").mkdir()
+    update = {name: value * 2 for name, value in qwen3_checkpoint().items()}
+    for rank in range(2):
+        _write_qwen3_checkpoint(tmp_path / f"rank-{rank}", update, "safetensors")
+    torch.save(qwen3_checkpoint(), tmp_path / "rank-1" / "pytorch_model.bin")
+    torch.multiprocessing.spawn(
+        _check_disk_refusal_on_rank, args=(str(tmp_path), True), nprocs=2
     )
 
 
@@ -329,6 +539,7 @@ class TestDeviceRouting:
 
         runner = mock.Mock()
         runner.update_weights_from_disk.return_value = (True, "ok")
+        runner.check_ascend_disk_update.return_value = (True, "ready")
         handle = AscendMemorySaverDeviceHandle.__new__(AscendMemorySaverDeviceHandle)
         handle._executor = _device_handle(runner)._executor
         handle._weight_memory = state = mock.Mock(

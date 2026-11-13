@@ -18,6 +18,111 @@ and full GSM8K recovery with a same-TP no-pause control. The two hosts
 reported driver 25.5.6 and matching hashes for the CANN runtime and HCCL
 libraries used by the tests.
 
+### KV lifecycle and allocator guard regression
+
+A subsequent review added graph-to-KV release pairing, a mandatory host-cache
+flush before Ascend weight updates, startup backing-storage checks, and a
+terminal fault when allocation rollback also fails. These targeted regressions
+used the same PTA 2.9.0-730 backport stack and CANN 9.0.0.
+
+| Regression | Result |
+| --- | --- |
+| Plain graph discard | Three cycles, batch sizes 1, 3 and 4. Graph identity and addresses stayed unchanged, with no recapture. Outputs matched a fresh worker. Each suspend released 1,800 MiB of device KV and 254 MiB of graph backing. |
+| Synthetic MTP graph backup | Three cycles at the same batch sizes. Tokens and verification metrics matched the fresh worker. Each suspend released the shared 1,864 MiB target/draft KV arena and 254 MiB graph backing. Graph bytes were backed up. |
+| Disk replacement with host caches enabled | Same-weight KV sleep retained a 192-token host prefix hit. A false-flush update was refused without applying weights. A complete update with flushing produced zero old cache hits and matched fresh checkpoint B. |
+| SDK replacement with synthetic MTP refresh | The file-backed SDK fixture replaced complete target and draft weights. The same cache-flush checks passed, with 11 verifies per 12-token output and the same tokens and MTP metrics as fresh checkpoint B. This rerun does not extend the real TCP transport coverage below. |
+| TP2 discard smoke | Eight prompts, capped at 64 output tokens each. All eight output token sequences matched before and after remapping and a complete same-checkpoint reload. Both ranks reused their captured graphs and exited cleanly. This short token regression is not a GSM8K accuracy qualification. |
+| Disabled PTA caching allocator | `PYTORCH_NO_NPU_MEMORY_CACHING=1` was rejected at startup. The selected device was idle afterward. |
+| Adapter and weight-state regressions | 36 adapter/state tests and 27 subtests, four native fake-ACL cases, and 91 weight-update tests with five subtests passed. The weight module uses CPU fixtures and also executes four small NPU SDK-stream cases when an NPU is available. It includes four new false-flush refusals and the stale NPCACHE check. |
+| Native host regression | 164 control, 79 serving, and 28 host tests passed, with three host tests ignored. The separate control/wire harness passed 16 control and 24 wire tests, including unchanged GPU graph-only behavior. |
+
+Two initial hardware attempts exposed stale test expectations. The MTP test
+expected discard poisoning while the actual graph policy was backup. The
+guard refused to overwrite a backup allocation. The TP2 negative test expected
+a `weights,acl_graph` request to omit KV, while graph release now deliberately
+adds it. The corrected cases select the actual graph policy and use a
+weight-only request to test refusal beneath live KV. Product eligibility and
+weight safety checks were preserved.
+
+Two A2 hosts also passed a native eight-rank HCCL probe with four cards each.
+AllReduce at two sizes and two captured ACL Graph replays with changed inputs
+returned the expected sums on every rank. The selected cards were idle after
+group destruction. This verifies transport and native graph prerequisites.
+TokenSpeed Ascend Saver retains its single-node scope check, so cross-host
+model serving and Saver sleep/resume remain unqualified.
+
+Physical NVIDIA and AMD regression was unavailable. The control tests and code
+review verify that this pairing matches only `acl_graph`, while CUDA/ROCm keep
+their existing `cuda_graph` behavior. Draft overlap was preserved. Explicitly
+forcing FIA for in-graph narrowed draft lengths remains a separate configuration
+restriction. Subsequent disk admission checks reject mixed AUTO file families
+and unsupported readers before cache invalidation or a weight transaction.
+
+### FIA causal-length controls
+
+The earlier explanation needed a query-shape qualification. Causal masking
+correctly protects a full five-query verification at KV length 105. Narrowing
+its second query to a single row removes that row's original absolute position
+from the native FIA call. The single-query wrapper uses no mask and
+`sparse_mode=0`. An effective length of 102 or an explicit absolute-position
+mask is then required to preserve the original boundary. A KV-length mismatch
+alone does not establish leakage for every causal attention call.
+
+A standalone A2 test ran the real wrapper and native FIA on the pinned
+PTA build, in FP16 and BF16. Q and K were zero. The first 102 V positions
+were zero and positions 102 through 104 held 1000. Uniform attention therefore
+provides a simple reference.
+
+| Control | FP16 | BF16 |
+| --- | ---: | ---: |
+| Five-query causal verify, KV105, query row 1 | 0 | 0 |
+| Narrowed single query, KV102 | 0 | 0 |
+| Narrowed single query, KV105, no mask | 28.578125 | 28.625 |
+| Single query, KV105, full absolute-frontier mask | 0 | 0 |
+
+One captured graph containing five-query and single-query FIA calls reproduced
+the difference. Broadcasting KV105 preserved the target mask but admitted the
+tail in the single-query result. Per-task updates with lengths 105 and 102
+returned zero for the selected target row and the draft. Broadcasting 105 again
+reproduced the tail contribution. Each dtype passed 17 numerical checks.
+Compressed single-query masks produced two expected unsupported-shape
+diagnostics per dtype. Explicit single-query `sparse_mode=3` without a mask
+did not exclude the tail. The selected NPU was idle before and after testing.
+
+This isolates attention metadata behavior without a model or Saver activation.
+It does not measure full-model accuracy. Automatic draft capture still uses
+Triton, and the test did not change FIA selection or draft overlap.
+[Official FIA mask and length interface](https://github.com/Ascend/op-plugin/blob/master/docs/en/custom_APIs/torch_npu/torch_npu-npu_fused_infer_attention_score.md)
+
+### Disk-format admission regression
+
+Ascend Saver now validates the disk reader and selectable file families in
+admission under both weight policies. NPCACHE and other non-direct readers,
+and ambiguous AUTO folders, are refused before cache invalidation and weight
+transaction start. The generic device handle and CPU/CUDA/ROCm disk path are
+unchanged. An explicit direct format can select the intended family. Optimizer
+files, inactive PT files, and index metadata without corresponding shards
+follow existing loader selection rules.
+
+The final two-module runtime regression passed 112 tests and five subtests,
+with no skips, on the pinned PTA build. Most fixtures use CPU tensors; four
+SDK-stream cases use small real NPU tensors. New checks cover both weight
+policies, stale NPCACHE data, same-path direct rereads, mixed AUTO refusal,
+explicit-format retry, PT shape validation and two-rank admission/retry.
+
+The A2 BF16 model test discarded weight and KV backing, restored the mappings,
+then attempted NPCACHE and mixed AUTO updates at version 2. Both were refused
+while KV remained asleep. A valid AUTO request at the same version succeeded
+without restarting the worker. Both output token sequences matched fresh
+checkpoint B, old prefix hits fell from 192 to zero, weight addresses stayed
+fixed, and the original graph replayed without recapture. The selected device
+was idle before and after. This validates retry behavior for these admission
+errors, rather than recovery from a failure after parameter writes begin.
+
+Publish immutable version directories. Admission does not lock checkpoint
+files against external modifications during loading. A later read or complete
+weight-coverage failure after transaction start can still require restart.
+
 ### Mooncake update after pause
 
 The TP1 Qwen3-0.6B run used a dummy MTP draft and the `refresh` policy.

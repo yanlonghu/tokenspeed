@@ -686,7 +686,9 @@ def run(args, report):
             if args.weight_memory_policy == "discard":
                 report["early_weights_release_refusal"] = refused(
                     driver,
-                    ReleaseMemoryOccupationReqInput(tags=["weights", "acl_graph"]),
+                    # Graph release now includes KV; weight-only release must
+                    # still reject discarding weights beneath live KV.
+                    ReleaseMemoryOccupationReqInput(tags=["weights"]),
                     "Release KV before discarding weights",
                 )
                 sleeping(driver, False)

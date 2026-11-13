@@ -20,7 +20,9 @@
 
 from __future__ import annotations
 
+import glob
 import inspect
+import os
 from contextlib import ExitStack
 from itertools import chain
 from typing import TYPE_CHECKING
@@ -786,8 +788,8 @@ class ModelRunner:
         """Construct the checkpoint loader with the runner's startup settings.
 
         Reuse the download, prefetch and rank-group settings used to build the
-        model. The complete Ascend caller restricts the returned reader before
-        it opens a checkpoint so file admission can finish without a device
+        model. Ascend saver admission restricts the returned reader before
+        it opens a checkpoint so file checks can finish without a device
         collective or a stale cached copy.
         """
         from tokenspeed.runtime.configs.load_config import LoadConfig
@@ -804,6 +806,78 @@ class ModelRunner:
             )
         )
 
+    def check_ascend_disk_update(self, obj) -> tuple[bool, str]:
+        """Check saver disk formats before cache invalidation or a transaction."""
+        try:
+            self._ascend_disk_reload_loader(obj)
+        except Exception as exc:
+            return False, f"{exc}; nothing was written"
+        return True, "ready for Ascend disk weight update"
+
+    def _ascend_disk_reload_loader(self, obj) -> DefaultModelLoader:
+        """Use a direct reader and refuse an ambiguous AUTO checkpoint folder."""
+        from tokenspeed.runtime.configs.load_config import LoadFormat
+        from tokenspeed.runtime.model_loader.loader import DefaultModelLoader
+        from tokenspeed.runtime.model_loader.weight_utils import (
+            filter_duplicate_safetensors_files,
+            filter_files_not_needed_for_inference,
+        )
+
+        load_format = obj.load_format or self.server_args.load_format
+        direct_formats = (
+            LoadFormat.AUTO,
+            LoadFormat.SAFETENSORS,
+            LoadFormat.PT,
+            LoadFormat.MISTRAL,
+        )
+        # Validate before constructing a custom loader. NPCACHE can retain an
+        # older checkpoint at the same path; InstantTensor is a CUDA reader.
+        if (
+            not isinstance(load_format, str)
+            or load_format.lower() not in direct_formats
+        ):
+            raise ValueError(
+                "Ascend Memory Saver disk reload requires a direct CPU checkpoint "
+                f"reader; load_format {load_format!r} is unsupported. Use "
+                "'safetensors', 'pt', 'mistral', or 'auto' with one checkpoint "
+                "file family"
+            )
+        loader = self._disk_reload_loader(load_format)
+        if type(loader) is not DefaultModelLoader:
+            raise ValueError(
+                "Ascend Memory Saver disk reload requires DefaultModelLoader"
+            )
+        fall_back_to_pt = getattr(self.model, "fall_back_to_pt_during_load", False)
+        folder, _, _ = loader._prepare_weights(
+            str(obj.model_path), None, fall_back_to_pt
+        )
+        if loader.load_config.load_format == LoadFormat.AUTO:
+            # Follow startup's shard selection and exclusions, but inspect all
+            # eligible families instead of silently preferring older safetensors.
+            families = []
+            safetensors = glob.glob(os.path.join(folder, "*.safetensors"))
+            if safetensors:
+                safetensors = filter_duplicate_safetensors_files(
+                    safetensors, folder, "model.safetensors.index.json"
+                )
+            if safetensors:
+                families.append("safetensors")
+            extensions = ("bin", "pt") if fall_back_to_pt else ("bin",)
+            for extension in extensions:
+                files = filter_files_not_needed_for_inference(
+                    glob.glob(os.path.join(folder, f"*.{extension}"))
+                )
+                if files:
+                    families.append(extension)
+            if len(families) > 1:
+                raise ValueError(
+                    f"Ascend Memory Saver load_format 'auto' is ambiguous at "
+                    f"{str(obj.model_path)!r}: found checkpoint file families "
+                    f"{', '.join(families)}. Select an explicit load_format or "
+                    "publish one checkpoint family in an immutable version directory"
+                )
+        return loader
+
     def _update_complete_ascend_disk(self, obj) -> tuple[bool, str]:
         """Restore discarded Ascend weights after their storage is remapped.
 
@@ -815,9 +889,7 @@ class ModelRunner:
         work completes. The host commits the replica result. A failed load leaves
         the begun transaction invalid even when the inventory refused all writes.
         """
-        from tokenspeed.runtime.configs.load_config import LoadFormat
         from tokenspeed.runtime.model_loader.loader import (
-            DefaultModelLoader,
             post_load_transformed_modules,
         )
 
@@ -839,19 +911,7 @@ class ModelRunner:
                     raise ValueError(
                         f"Cannot reload transformed Ascend weights: {transformed}"
                     )
-                load_format = obj.load_format or self.server_args.load_format
-                loader = self._disk_reload_loader(load_format)
-                # NPCACHE can reuse arrays from an earlier version at this path.
-                if not isinstance(
-                    loader, DefaultModelLoader
-                ) or loader.load_config.load_format in (
-                    LoadFormat.INSTANTTENSOR,
-                    LoadFormat.NPCACHE,
-                ):
-                    raise ValueError(
-                        "Ascend complete disk reload requires a direct CPU checkpoint "
-                        f"reader; load_format {load_format!r} is unsupported. Use 'auto'."
-                    )
+                loader = self._ascend_disk_reload_loader(obj)
                 shapes = self._check_complete_ascend_disk_reload(loader, model_path)
             except Exception as exc:
                 preparation_error = exc

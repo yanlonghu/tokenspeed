@@ -57,6 +57,10 @@ def run(args, report):
         tokenizer.encode(text, add_special_tokens=False)
         for text in ("The capital of France is", "Two plus two equals")
     ]
+    if args.verify_cache_flush:
+        # A repeated prompt must publish at least one complete KV page.
+        prefix = tokenizer.encode("A long prefix for cache reuse. " * 32)
+        prompts[0] = prefix + prompts[0]
     sampling = {"temperature": 0, "ignore_eos": True, "max_new_tokens": 12}
     trace_path = args.output_dir / "graph-trace.jsonl"
     trace_dir = Path(__file__).resolve().parent / "trace"
@@ -79,6 +83,24 @@ def run(args, report):
         "directory": str(sdk_directory),
         "expect_snapshot": snapshot is not None,
     }
+    ambiguous_checkpoint = args.output_dir.resolve() / "ambiguous-auto"
+    if args.verify_disk_format_preflight:
+        ambiguous_checkpoint.mkdir()
+        for checkpoint_file in args.updated.iterdir():
+            if checkpoint_file.name == "config.json" or checkpoint_file.name.endswith(
+                (".safetensors", ".safetensors.index.json")
+            ):
+                (ambiguous_checkpoint / checkpoint_file.name).symlink_to(
+                    checkpoint_file.resolve()
+                )
+        require(
+            any(ambiguous_checkpoint.glob("*.safetensors")),
+            "Format preflight requires a safetensors replacement checkpoint",
+        )
+        # This marker must be rejected as a second family before it is read.
+        (ambiguous_checkpoint / "pytorch_model.bin").write_text(
+            "Ambiguous checkpoint family marker; do not deserialize.\n"
+        )
     publisher = None
     if args.mooncake_fixture:
         checkpoints = {"target": args.incomplete or args.updated}
@@ -170,7 +192,7 @@ def run(args, report):
                     draft_policy,
                 )
             )
-        if args.verify_namespace:
+        if args.verify_namespace or args.verify_cache_flush:
             launch_args.remove("--disable-kvstore")
             launch_args.remove("--disable-prefix-caching")
             launch_args.extend(
@@ -208,6 +230,7 @@ def run(args, report):
         return [
             {
                 "ids": out.output_ids,
+                "cached_tokens": out.cached_tokens,
                 "verify_count": out.spec_verify_ct,
                 "accept_length": out.accept_draft_tokens,
             }
@@ -221,16 +244,21 @@ def run(args, report):
     def token_ids(outputs):
         return [out["ids"] for out in outputs]
 
-    def weight_update():
+    def weight_update(*, flush_cache=True):
         if args.mooncake_fixture:
             return UpdateWeightsFromMooncakeReqInput(
                 version=version,
-                flush_cache=True,
+                flush_cache=flush_cache,
                 weight_version=None,
                 snapshot=snapshot,
             )
         return UpdateWeightFromDiskReqInput(
-            model_path=str(args.incomplete or args.updated)
+            model_path=str(args.incomplete or args.updated),
+            load_format="auto" if args.verify_disk_format_preflight else None,
+            flush_cache=flush_cache,
+            weight_version=(
+                str(version) if args.verify_cache_flush and flush_cache else None
+            ),
         )
 
     if args.incomplete:
@@ -297,6 +325,16 @@ def run(args, report):
     graph_tags = [] if args.eager else ["acl_graph"]
     with launch(args.initial, "discard", trace=True) as driver:
         report["before"] = infer(driver)
+        if args.verify_cache_flush:
+            # With unchanged weights a KV-only cycle removes L1 and lets
+            # the first resumed request prove the prefix survived off-device.
+            control(driver, ReleaseMemoryOccupationReqInput(tags=["kv_cache"]))
+            control(driver, ResumeMemoryOccupationReqInput(tags=["kv_cache"]))
+            report["retained_cache_tokens"] = infer(driver)[0]["cached_tokens"]
+            require(
+                report["retained_cache_tokens"] > 0,
+                "No retained prefix after KV-only wake",
+            )
         control(
             driver,
             ReleaseMemoryOccupationReqInput(tags=["kv_cache", "weights", *graph_tags]),
@@ -305,9 +343,62 @@ def run(args, report):
             driver,
             ResumeMemoryOccupationReqInput(tags=[*graph_tags, "weights"]),
         )
+        if args.verify_cache_flush:
+            replies = driver.control(weight_update(flush_cache=False))
+            require(
+                len(replies) == 1
+                and not replies[0].success
+                and "require flush_cache=true" in replies[0].message,
+                f"Replacement without cache flush must fail: {replies}",
+            )
+            report["cache_flush_refusal"] = replies[0].message
+        if args.verify_disk_format_preflight:
+            report["disk_format_refusals"] = []
+            for model_path, load_format, expected in (
+                (args.updated, "npcache", "load_format 'npcache' is unsupported"),
+                (
+                    ambiguous_checkpoint,
+                    "auto",
+                    "load_format 'auto' is ambiguous",
+                ),
+            ):
+                replies = driver.control(
+                    UpdateWeightFromDiskReqInput(
+                        model_path=str(model_path),
+                        load_format=load_format,
+                        flush_cache=True,
+                        weight_version=str(version),
+                    )
+                )
+                require(
+                    len(replies) == 1
+                    and not replies[0].success
+                    and expected in replies[0].message
+                    and "nothing was written" in replies[0].message,
+                    f"Unexpected disk format preflight response: {replies}",
+                )
+                report["disk_format_refusals"].append(
+                    {
+                        "load_format": load_format,
+                        "weight_version": str(version),
+                        "message": replies[0].message,
+                    }
+                )
+                sleeping = driver.control(IsSleepingReqInput())
+                require(
+                    len(sleeping) == 1 and sleeping[0].is_sleeping,
+                    "KV must remain asleep after a disk format refusal",
+                )
         control(driver, weight_update())
+        if args.verify_disk_format_preflight:
+            report["disk_format_retry_weight_version"] = str(version)
         control(driver, ResumeMemoryOccupationReqInput(tags=["kv_cache"]))
         report["after"] = infer(driver)
+        if args.verify_cache_flush:
+            require(
+                all(row["cached_tokens"] == 0 for row in report["after"]),
+                "Replacement reused a prefix from the previous weights",
+            )
 
     events = read_trace(trace_path)
     transitions = [
@@ -339,6 +430,7 @@ def run(args, report):
             "Incorrect weight mapping or Host snapshot",
         )
         allocations = list(after.values())
+    report["weight_virtual_addresses_unchanged"] = True
     policies = {block["policy"] for block in allocations}
     require(
         policies
@@ -375,6 +467,8 @@ def run(args, report):
             ),
             "Unexpected recapture after wake",
         )
+        report["original_graph_replayed"] = True
+        report["recaptured_after_wake"] = False
     require(
         token_ids(report["before"]) != token_ids(report["fresh"]),
         "Checkpoint B does not change the probe outputs",
@@ -425,6 +519,16 @@ def main():
     parser.add_argument(
         "--incomplete", type=Path, help="Expect an incomplete checkpoint refusal"
     )
+    parser.add_argument(
+        "--verify-cache-flush",
+        action="store_true",
+        help="Warm Host prefix caches and check their invalidation on replacement",
+    )
+    parser.add_argument(
+        "--verify-disk-format-preflight",
+        action="store_true",
+        help="Refuse unsupported and ambiguous disk formats before a valid retry",
+    )
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
@@ -438,6 +542,15 @@ def main():
         parser.error("--updated-draft requires --draft")
     if args.verify_namespace and not (args.mooncake_fixture and args.incomplete):
         parser.error("--verify-namespace requires --mooncake-fixture and --incomplete")
+    if args.verify_cache_flush and args.incomplete:
+        parser.error("--verify-cache-flush requires a complete replacement checkpoint")
+    if args.verify_disk_format_preflight:
+        if args.mooncake_fixture or args.incomplete:
+            parser.error(
+                "--verify-disk-format-preflight requires a complete disk replacement"
+            )
+        if not args.verify_cache_flush:
+            parser.error("--verify-disk-format-preflight requires --verify-cache-flush")
     args.output_dir.mkdir(parents=True, exist_ok=False)
     report = {"status": "failed"}
     try:

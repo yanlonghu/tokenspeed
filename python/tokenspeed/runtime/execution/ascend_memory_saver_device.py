@@ -75,6 +75,10 @@ class AscendMemorySaverDeviceHandle(DeviceHandle):
         ready, message = super().check_weight_update(req)
         if not ready:
             return ready, message
+        # Suspend clears device KV only. The host must invalidate old L2/L3
+        # prefixes before any rank writes new weights, including draft inputs.
+        if not req.flush_cache:
+            return False, "Ascend Memory Saver weight updates require flush_cache=true"
         if type(req) is UpdateWeightsFromMooncakeReqInput:
             return self._executor.model_runner.check_ascend_mooncake_update(
                 self._mooncake_update_models()
@@ -86,6 +90,10 @@ class AscendMemorySaverDeviceHandle(DeviceHandle):
             and len(self._weight_memory.models) > 1
         ):
             return False, "Use Model Updater SDK to replace discarded draft weights"
+        if type(req) is UpdateWeightFromDiskReqInput:
+            # The host agrees admission before cache invalidation, and the
+            # local update checks again before beginning a weight transaction.
+            return self._executor.model_runner.check_ascend_disk_update(req)
         return ready, message
 
     def update_weights(self, req) -> tuple[bool, str]:

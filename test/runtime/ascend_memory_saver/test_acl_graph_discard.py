@@ -202,7 +202,8 @@ def run(args, report):
         for cycle in range(1, args.cycles + 1):
             for req, sleeping in (
                 (ReleaseMemoryOccupationReqInput(tags=["acl_graph"]), True),
-                (ResumeMemoryOccupationReqInput(tags=["acl_graph"]), False),
+                (ResumeMemoryOccupationReqInput(tags=["acl_graph"]), True),
+                (ResumeMemoryOccupationReqInput(tags=["kv_cache"]), False),
             ):
                 result = reply(driver, req)
                 require(result.success, f"Graph transition failed: {result}")
@@ -220,6 +221,13 @@ def run(args, report):
             )
             rows = read_trace(trace_path)[offset:]
             offset += len(rows)
+            kv_rows = [row for row in rows if row.get("tag") == "kv_cache"]
+            require(
+                [row["event"] for row in kv_rows] == ["pause", "resume"],
+                f"Cycle {cycle}: graph suspend must discard and rebuild device KV",
+            )
+            # The graph assertions below inspect its independent private pool.
+            rows = [row for row in rows if row.get("tag") != "kv_cache"]
             require(
                 not any(
                     row["event"] in ("capture_begin", "capture_end", "reset")

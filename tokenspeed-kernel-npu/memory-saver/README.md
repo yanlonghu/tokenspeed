@@ -36,6 +36,13 @@ The snapshot applies six upstream changes to PTA 2.9.0-730 at `9d40ac3`:
 PTA builds must provide `NPUPluggableAllocator`, `MemPool`, `use_mem_pool`,
 and ACL Graph capture into a user pool with allocator ownership preserved.
 The worker checks the required APIs and native library ABI at startup.
+After model loading and capture, it verifies NPU parameter storage, device KV
+regions, and captured graph-pool segments against live native VMM allocations.
+Tied parameters and views can share backing segments. Eager startup requires
+weight and KV backing without a graph pool. A captured graph may have an
+allocation-free pool. Keep
+`PYTORCH_NO_NPU_MEMORY_CACHING` unset or `0` so PTA routes these allocations
+through their managed MemPools.
 Qualify other PTA or CANN builds with the real-device probes, which check
 how PTA routes allocations and frees.
 
@@ -110,8 +117,12 @@ checked transition reuses the resources recorded for each segment. A fault
 from the void free callback is terminal for the worker. PTA relinquishes
 ownership before invoking this callback, so a known segment enters the
 releasing state even if context or device validation fails.
+An allocation failure remains retryable when its rollback releases every
+resource. A rollback failure retains the segment for cleanup and latches the
+same terminal callback fault, even when other managed pools remain healthy.
 `saver_collect_failed()` can finish releasing the segment on the original
-device and context. An explicit `saver_release()` that fails context or
+device and context. Cleanup preserves the terminal fault and requires worker
+restart before reuse. An explicit `saver_release()` that fails context or
 device validation preserves the segment's phase for the caller.
 
 `saver_stats()` reports physical, mapped, reserved and host bytes and the

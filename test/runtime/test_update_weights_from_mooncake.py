@@ -522,6 +522,27 @@ def _lose_weight_pages(state, model):
     state.release(lose_pages)
 
 
+@pytest.mark.parametrize("policy", ["cpu_backup", "discard"])
+@pytest.mark.parametrize(
+    "request_type", [UpdateWeightFromDiskReqInput, UpdateWeightsFromMooncakeReqInput]
+)
+def test_ascend_saver_requires_cache_flush_before_weight_update(policy, request_type):
+    model = _TinyDiscardModel()
+    state = WeightMemoryState(policy=policy, models=[model])
+    state.mark_kv_released()
+    executor = _executor(draft_policy="retain", with_draft=False)
+    handle = AscendMemorySaverDeviceHandle(executor, weight_memory=state)
+    fields = {"model_path": "/checkpoint-b"}
+    if request_type is UpdateWeightsFromMooncakeReqInput:
+        fields = {"version": 2, "weight_version": None}
+
+    ok, message = handle.update_weights(request_type(flush_cache=False, **fields))
+
+    assert not ok and "require flush_cache=true" in message
+    assert state.valid and not state.updating and not state.failed
+    assert state.kv_released
+
+
 def test_discarded_device_waits_for_global_commit_before_kv_wake(sdk, monkeypatch):
     handle, state, model = _discard_device(monkeypatch)
     address = model.a.data_ptr()
