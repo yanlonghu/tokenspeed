@@ -198,7 +198,9 @@ worker's own NPU. Configure all four launch flags:
 | `--model-update-engine-type` | Engine type accepted by that provider |
 | `--model-update-draft-weights` | `retain` to preserve independent draft weights, or `refresh` to replace them in the same version |
 
-Replace the disk update in step 3 with the published integer version.
+Keep KV asleep during the weight update. Replace the disk update in step 3
+with the published integer version, then wake KV after the update succeeds.
+The resumed worker builds fresh KV for new requests.
 
 ```bash
 rl update_weights_from_mooncake '{"version":42,"flush_cache":true}'
@@ -225,9 +227,11 @@ independent draft weights together. Shared tensors are updated by the target.
 - Graph discard and weight discard have separate eligibility checks. The
   audited TP1 Llama EAGLE3, DFLASH, and vanilla DSPARK graph configurations
   use backed-up weights. The validated complete target-and-draft refresh
-  used a synthetic Qwen3-compatible MTP draft and a local Mooncake TCP
-  test provider. Production SDK transport and native draft refresh have
-  separate qualification requirements.
+  used a synthetic Qwen3-compatible MTP draft and a test SDK provider.
+  Mooncake TCP tests also cover a remote publisher with one serving rank
+  and a local publisher with two serving ranks. Production SDK transport
+  and native draft refresh have separate qualification requirements.
+  [Mooncake validation](ascend-memory-saver-test-report.md#delivery-validation-on-pta-290-730)
 - Real-device acceptance tests exercise address preservation, graph replay,
   and per-rank memory accounting. Run them against the stack you will
   deploy. [Hardware acceptance tests](../../test/runtime/ascend_memory_saver/README.md)

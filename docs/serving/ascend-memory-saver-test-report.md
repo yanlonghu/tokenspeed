@@ -4,6 +4,222 @@ All **25 in-scope acceptance checks passed** on Atlas A2 (Ascend 910B3) with CAN
 
 See the [serving guide](ascend-memory-saver.md) and [design](../design/ascend-acl-graph-memory-saver.md). [Hardware test commands](https://github.com/yanlonghu/tokenspeed/blob/7f89b744f5759bbe5eca22b339a29a9fd535c46c/test/runtime/ascend_memory_saver/README.md)
 
+## Delivery validation on PTA 2.9.0-730
+
+The delivery stack uses PyTorch 2.9.0 CPU, PTA 2.9.0-730 plus the six
+backports at `ee1742b06d2c0e59cb0b357288ec29ee190cfd2d`, CANN and HCCL 9.0.0,
+and the tested TokenSpeed runtime at `7f89b744`. The supplemental runs
+used Atlas A2 (910B3) with this same runtime and native saver. The 25
+original acceptance checks remain the baseline for this stack.
+
+The two-host delivery run covers Mooncake updates after KV discard, a
+separate Torch process using device memory while the Saver worker sleeps,
+and full GSM8K recovery with a same-TP no-pause control. The two hosts
+reported driver 25.5.6 and matching hashes for the CANN runtime and HCCL
+libraries used by the tests.
+
+### Mooncake update after pause
+
+The TP1 Qwen3-0.6B run used a dummy MTP draft and the `refresh` policy.
+The worker drained and discarded the KV arena, weights and graph pool before
+a separate publisher wrote version 2 to the real Mooncake TCP Store.
+The publisher wrote 311 target objects and 13 draft objects with a combined
+payload of 1,538,960,200 bytes. The test used a loopback TCP connection,
+CPU staging and a synthetic Model Updater SDK provider.
+
+The worker restored graph and weight mappings, rejected an early KV wake,
+then loaded and committed the complete target and draft via
+`update_weights_from_mooncake`. KV remained asleep until explicitly woken.
+The worker remapped and cleared KV before admitting new requests. Both
+outputs matched a fresh start on the new weights, with 11 MTP verifies per
+request. The three regions retained their original virtual addresses and
+the worker replayed the original graph with zero recaptures. New requests
+built fresh KV.
+
+| TP1 phase | Result |
+| --- | ---: |
+| Physical memory released | 3,746 MiB total (1,864 KV, 1,628 weights, 254 graph) |
+| Pause control | 244.67 ms |
+| Publisher Store setup and puts | 2,168.13 ms |
+| Graph and weights remap control | 11.92 ms |
+| Mooncake weight update and commit | 2,200.19 ms |
+| KV wake control | 2,048.62 ms |
+
+These are stage timings from one run. The publication timer starts after
+the publisher imports its dependencies. KV wake generated new Triton
+artifacts for the KV clear kernel and the allocator's remap took 1.84 ms.
+
+### Mooncake target update and rejected streams
+
+The TP2 target-only test also published version 2 after the replica went
+to sleep. A test SDK reader on each rank fetched the same 311 canonical
+checkpoint tensors from the loopback TCP Store. The TokenSpeed model loader
+applied TP slicing locally. Both ranks completed the same version and
+reused their original graph and virtual addresses. Both prompts matched
+fresh checkpoint B. Each rank released 900 MiB of KV, 638 MiB of weights,
+and 254 MiB of graph backing. Pause, graph and weight remap, update and
+commit, and KV wake took 137.51, 8.16, 1,981.63, and 2,153.21 ms respectively.
+This test covers rank agreement with two complete readers and duplicates
+the checkpoint stream across readers.
+
+A TP1 negative test published only two target tensors over TCP. The update
+failed on missing checkpoint weights. The serving worker stayed asleep,
+retained its original cache namespace, and refused KV wake with a restart
+requirement. A fresh worker loaded the complete checkpoint B and generated
+the expected new first token. Both workers exited cleanly.
+
+A second TP1 negative test published all 311 target tensors and 12 of the
+13 dummy MTP draft tensors for a `refresh` update. The worker reported
+`eh_proj.weight` missing, kept the old cache namespace current, and rejected
+the retry and KV wake with a restart requirement. The trace recorded zero KV
+resume operations. After restart with the complete checkpoint B, both
+12-token outputs and the 11 verify steps per request matched an independent
+fresh-B reference. Both workers exited cleanly.
+
+In a TP2 negative test the Store contained a valid 311-tensor publication.
+Rank 0 read all 311 objects. The test SDK on rank 1 applied two tensors and
+then raised an exception. Rank 0 reported the peer error before entering
+post-load, and the replica returned a failed update in 2,517.55 ms. The
+original namespace stayed current, both ranks stayed KV-paused, and the
+worker refused KV wake and required restart. Both the failed worker and the
+fresh checkpoint B worker exited cleanly. This test injects a reader error
+with both ranks alive.
+
+### Cross-host Mooncake update
+
+A publisher on one A2 host transferred version 2 to a TP1 serving worker on
+a second A2 host over the actual Mooncake TCP Store. The test used CPU staging
+and a synthetic SDK provider. The reader fetched 311 target tensors totaling
+1,503,300,520 bytes, and its aggregate SHA-256 matched the publisher's. The
+worker used target `discard` and draft `retain` with a CPU backup. KV, weights
+and the graph pool were paused before the update. The worker rejected early KV
+wake, committed the new target, woke KV, and replayed the original graph with
+zero recaptures. Both output sequences and the recorded MTP metrics matched
+a separate cold start on checkpoint B with the retained draft. The worker
+exited cleanly.
+
+| Cross-host TP1 phase | Result |
+| --- | ---: |
+| Physical memory released | 3,768 MiB total (1,864 KV, 1,650 weights, 254 graph) |
+| Weight policy split | 1,296 MiB target discard, 354 MiB draft CPU backup |
+| Pause control | 275.38 ms |
+| Publisher serialization and Store puts | 4,492.83 ms |
+| Graph and weights remap control | 80.03 ms |
+| Mooncake weight update and commit | 3,899.55 ms |
+| KV wake control | 20.79 ms |
+
+The Store publisher and serving worker ran on separate hosts. The TP2 test
+above covers two serving ranks on one host.
+
+In a separate run, one serving process completed two consecutive updates,
+A to B at version 2 and B to A at version 3. Each round transferred 311
+target tensors and verified the payload digest. Both prompts matched their
+respective checkpoint references, both early KV wake requests were refused,
+and both rounds reused the original graph with zero recaptures.
+
+| Cross-host repeat, client wall time | Version 2, ms | Version 3, ms |
+| --- | ---: | ---: |
+| Suspend RPC | 271.18 | 276.92 |
+| Graph and weights remap RPC | 63.15 | 61.45 |
+| Weight update and commit RPC | 3,580.23 | 3,640.23 |
+| KV wake RPC | 21.13 | 13.09 |
+| Suspend request start to first token | 10,451.02 | 12,698.71 |
+| Weight commit reply to first token | 125.79 | 107.04 |
+| First inference request to first token | 102.08 | 91.24 |
+
+The suspend-to-token clock includes publication and the test controller's
+cross-host handshake. The weight-ready clock starts at the successful
+commit reply and includes KV wake. Both clocks stop at the first streamed
+token of the first resumed request.
+
+### HBM available to a separate process while serving is paused
+
+The TP1 Qwen3-0.6B worker stayed resident and asleep on the same card as an
+independent Torch process. The worker discarded 1,800 MiB of KV, 1,296 MiB
+of weights, and 254 MiB of graph backing. Device-wide free HBM rose by
+exactly 3,350 MiB according to `aclrtGetMemInfo(ACL_HBM_MEM)`.
+
+| Device-wide HBM sample | Free, MiB |
+| --- | ---: |
+| Before pause | 58,066.85 |
+| Paused, before starting the peer | 61,416.85 |
+| Paused, with the peer's 1 GiB tensor live | 60,328.18 |
+| Paused, after the peer exited | 61,414.45 |
+| After the serving worker resumed | 58,066.22 |
+
+The peer allocated and filled a 1 GiB tensor and read back sampled values.
+The card exposed 62,420 MiB to this driver query. About 1,003 MiB remained
+in use across the device at the first paused sample, including the sampler
+context. After the peer exited, the worker reloaded all 311 tensors of the
+same checkpoint, woke KV, and matched both pre-pause 12-token outputs with
+the same virtual addresses and original graph. The process exited normally.
+This was an allocation probe with more than 1 GiB free before pause. A real
+training step and its maximum sustainable memory use require separate tests.
+
+### Full GSM8K with all three regions discarded
+
+The supplemental full-dataset run used Qwen3-0.6B BF16, greedy decoding,
+thinking off, concurrency 32, and a 512-token cap. Each phase evaluated all
+1,319 questions from the same official GSM8K test split. Each pause worker
+served both phases. Between phases it discarded KV, target weights and
+graph-pool pages, restored the weight and graph mappings, reloaded and
+committed the same checkpoint from disk, and woke KV. Every pause arm
+tested rejection of early weight discard and early KV wake. A separate
+worker for each TP size repeated the same workload with Saver enabled and
+without a pause. The checkpoint and input files had identical hashes in
+both arms.
+
+Accuracy is the count of correct final boxed answers. Mean TPOT uses the
+wire client's first and last token times. Workload time excludes startup,
+warmup and the memory control calls. Pause and resume are separate client
+measurements. Resume starts with graph and weights remap and ends at the
+KV-wake reply, including disk reload and commit. The workers used disjoint
+devices and some runs shared a host concurrently. Treat the timings as
+observed single-run samples under that load. The tests record token IDs
+and collect no logits.
+
+| TP | Arm | Correct before → after | Mean TPOT, ms | Workload time, s | Token sequences / correctness judgments changed |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1 | Three-tag pause | 838 → 839 | 21.47 → 21.49 | 233.81 → 235.42 | 87 / 9 |
+| 1 | No pause | 838 → 839 | 22.52 → 22.72 | 245.29 → 248.90 | 87 / 9 |
+| 2 | Three-tag pause | 816 → 818 | 24.33 → 24.35 | 266.00 → 266.79 | 27 / 4 |
+| 2 | No pause | 816 → 818 | 24.39 → 24.22 | 266.76 → 265.40 | 27 / 4 |
+| 4 | Three-tag pause | 810 → 833 | 24.28 → 23.91 | 265.63 → 262.78 | 989 / 123 |
+| 4 | No pause | 834 → 826 | 24.02 → 23.88 | 264.64 → 261.76 | 979 / 118 |
+| 8 | Three-tag pause | 829 → 837 | 24.34 → 24.50 | 266.32 → 268.97 | 975 / 126 |
+| 8 | No pause | 829 → 826 | 24.86 → 24.84 | 273.86 → 272.65 | 991 / 119 |
+
+| TP | Released KV / weights / graph per rank, MiB | Pause, ms | Graph and weights remap, ms | Disk reload and commit, ms | KV wake, ms | Full resume, ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 3,592 / 1,296 / 254 | 308.84 | 10.31 | 406.84 | 28.65 | 448.85 |
+| 2 | 1,796 / 638 / 254 | 179.46 | 60.24 | 474.17 | 21.51 | 559.32 |
+| 4 | 898 / 324 / 254 | 112.96 | 16.64 | 337.78 | 2,250.39 | 2,608.07 |
+| 8 | 450 / 186 / 254 | 106.28 | 52.24 | 348.80 | 16.01 | 420.70 |
+
+These memory values count physical pages tracked by the Saver allocator.
+The KV arena is sized for this benchmark's serving configuration.
+The TP4 KV wake generated the Triton `_zero_byte_ranges_kernel` binary.
+Its first intermediate file and compiled binary appeared about 2.22 s
+apart within the 2,250.39 ms KV-wake RPC. Each rank's allocator remap was
+under 2 ms.
+
+All pause arms preserved virtual addresses and replayed startup graphs on
+every rank with zero recaptures. Each run completed both phases and exited
+cleanly.
+
+| TP | Exact output matches between arms, before / after | Questions changed in both arms | Same first differing position and ordered token IDs | Same divergence and full generated prefix |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 1,319 / 1,319 | 87 | 87 | 87 |
+| 2 | 1,319 / 1,319 | 27 | 27 | 27 |
+| 4 | 342 / 330 | 804 | 118 | 117 |
+| 8 | 334 / 326 | 806 | 110 | 110 |
+
+At TP1 and TP2 the pause arm reproduced the no-pause arm's exact outputs in
+each phase. TP4 and TP8 already differed between arms at baseline. The full
+dataset pairs show variability in both arms and leave any incremental Saver
+effect unresolved. The earlier targeted controls reproduced historical
+divergences with Saver disabled. [Saver-disabled logits control](#tp4-and-tp8-numerical-attribution)
+
 ## Stock TorchNPU 2.13.0 on A2
 
 The published TorchNPU 2.13.0 wheel contains the allocator lifecycle and
@@ -314,7 +530,8 @@ cargo build --release --locked -p tokenspeed-host --bin ts-host
 
 ## Remaining verification
 
-- Full-dataset GSM8K accuracy and performance on the stacked runtime remain outside the short recovery checks. TP4 and TP8 deterministic token parity and the source of the prefill drift are tracked under Ascend inference numerics.
-- The Mooncake tests used a synthetic provider and draft. Production provider, multi-rank and cross-host transport, RDMA, and a trained draft with distinguishable proposals remain unverified. Complete native EAGLE3, DFLASH and vanilla DSPARK refresh requires the model-specific checkpoint coverage and in-place derived-state updates. Independent drafter graphs, multi-rank drafting and model-specific DSPARK variants require their own evidence.
+- TP4 and TP8 deterministic token parity and the source of the prefill drift are tracked under Ascend inference numerics. The full-dataset run in this report records token IDs and aggregate accuracy. It adds no logits attribution.
+- The Mooncake tests used a synthetic provider and draft. Production Model Updater SDK integration, direct or sharded rank-local transfer, RDMA, and a serving replica spread across hosts require separate tests. Connection loss and rank death during a Mooncake update also require separate failure tests. A trained draft with distinguishable proposals, complete native EAGLE3, DFLASH and vanilla DSPARK refresh, independent drafter graphs, multi-rank drafting and model-specific DSPARK variants require separate evidence.
 - CUDA and ROCm hardware parity, Atlas A3 and other CANN/PTA versions require device tests. Protocol 2 compatibility and the backend boundaries passed CPU and source checks on the combined build.
+- The colocation probe verifies the increase in driver-global free HBM and a live Torch allocation. Measure a real trainer step and its peak memory when selecting a production configuration.
 - Host offload of the ACL Graph executable and HCCL communicator reclamation are outside the integrated feature. The HCCL watchdog crash and explicit destroy after peer loss remain open under Ascend distributed teardown. The default Saver path keeps the HCCL communicator resident.
