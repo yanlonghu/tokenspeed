@@ -1215,6 +1215,12 @@ class HostBootstrap:
                     "Engram input history requires PP=1 and in-flight depth <= 1"
                 )
 
+            if server_args.device == "npu":
+                from tokenspeed.runtime.layers.attention.registry import (
+                    validate_npu_mtp_verify_width,
+                )
+
+                validate_npu_mtp_verify_width(server_args, model_config)
             min_per_gpu_mem = init_distributed(
                 server_args,
                 port_args,
@@ -1352,8 +1358,12 @@ class HostBootstrap:
             )
             regions = memory_regions(
                 device.handle,
-                TorchMemorySaverAdapter.create(enable=server_args.enable_memory_saver),
-                nccl_suspendable=nccl_suspend_supported(),
+                TorchMemorySaverAdapter.create(
+                    enable=server_args.enable_memory_saver, device=server_args.device
+                ),
+                graph_tag="acl_graph" if server_args.device == "npu" else "cuda_graph",
+                nccl_suspendable=server_args.device != "npu"
+                and nccl_suspend_supported(),
                 replica_memory_transitions=replica_memory_transitions,
             )
             # EPD: a multimodal prefill node's first stage receives image
@@ -1645,6 +1655,11 @@ class HostBootstrap:
             self._memory_sampler.stop()
             self._memory_sampler = None
         self._device.shutdown_cache()
+        if self._server_args.device == "npu":
+            # Finish device work and release the process groups while CANN
+            # is still live. The host keeps Python alive through libc exit.
+            torch.npu.synchronize(self._gpu_id)
+            pg_manager.shutdown()
 
 
 def prepare_bootstrap(
@@ -1659,6 +1674,12 @@ def prepare_bootstrap(
     def start(pd_outbox, protocol: int, host_spans) -> HostBootstrap | EncodeBootstrap:
         # Protocol 2 agrees on weight-load prerequisites and commits. Protocol
         # 3 also agrees on memory transitions, when the host supports it.
+        if replica_memory_transitions and server_args.device == "npu" and protocol < 3:
+            raise RuntimeError(
+                "Ascend memory saver requires ts-host protocol 3 for replica-wide "
+                "memory transitions. Please rebuild tokenspeed-engine together with "
+                "this runtime"
+            )
         if server_args.enable_memory_saver and protocol < 2:
             raise RuntimeError(
                 "Memory saver requires a ts-host binary with weight-update commit "
