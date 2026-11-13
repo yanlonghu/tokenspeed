@@ -7,29 +7,70 @@ same device addresses.
 
 ## Before you start
 
-Use Linux aarch64 with Atlas A2 (Ascend 910B3), CANN 9.0.0, and PyTorch 2.9.0
-for the validated setup. Install a `torch_npu` wheel built from the
-PTA 2.9.0-730 backport and compatible with your Python, PyTorch C++ ABI,
-and CANN installation. The public commit `74e6508b` has the same source tree
-as the tested build `ee1742b`, which used Python 3.12.
-[PTA backport branch](https://gitcode.com/Huyanlong/pytorch/tree/backport/pta-730-acl-graph-offload)
-· [Pinned PTA source and build instructions](https://gitcode.com/Huyanlong/pytorch/tree/74e6508b896f630e5d5cacd39a3877047e91c19a)
+The single-host Atlas A2 (Ascend 910B3) tests used Linux aarch64 and Python 3.12.
+Choose the PyTorch and TorchNPU packages together in a dedicated virtual environment.
+
+| TorchNPU option | PyTorch | CANN | Package source |
+| --- | --- | --- | --- |
+| Stock `2.13.0` | `2.13.0+cpu` | `9.0.0` in the TokenSpeed A2 Docker test. Ascend's official release pairs this wheel with `9.2.0`. | Install the released wheel. It includes the six changes required by the Saver. |
+| Backported `2.9.0-730` | `2.9.0` | `9.0.0` in the original 25-check acceptance. | Build the [pinned backport source](https://gitcode.com/Huyanlong/pytorch/tree/74e6508b896f630e5d5cacd39a3877047e91c19a) for your Python and PyTorch C++ ABI. Its tree matches the tested build `ee1742b`. |
+
+The stock-wheel run covered TP1, TP2, TP4 and TP8 on one A2 host, including
+graph reuse, disk and Mooncake weight updates, and 100 dummy MTP graph cycles.
+See the report for the token comparisons and coverage boundaries.
+[A2 compatibility results](ascend-memory-saver-test-report.md#stock-torchnpu-2130-on-a2)
+· [TorchNPU release](https://gitcode.com/Ascend/pytorch/releases/tag/v26.2.0-pytorch2.13.0)
+· [Ascend version matrix](https://github.com/Ascend/pytorch/blob/master/COMPATIBILITY.en.md)
+
+### Install the stock 2.13.0 packages
+
+With a Python 3.12 virtual environment active, download the three Linux
+aarch64 wheels below into the same directory. Most serving tests used Ascend's
+published PyTorch CPU build with its ARM allocator fix. Use the matching
+TorchVision build for Torch 2.13.0. Compressed Tensors 0.15.0.1 removes the
+Torch upper bound in the older 0.15.0 release.
+[PyTorch 2.13.0 CPU wheel](https://gitcode.com/Ascend/pytorch/releases/download/v26.2.0-pytorch2.13.0/torch-2.13.0%2bcpu-cp312-cp312-manylinux_2_28_aarch64.whl)
+· [TorchNPU 2.13.0 wheels](https://pypi.org/project/torch-npu/2.13.0/#files)
+· [TorchVision CPU wheels](https://download.pytorch.org/whl/cpu/torchvision/)
+· [Compressed Tensors release](https://github.com/vllm-project/compressed-tensors/releases/tag/0.15.0.1)
+
+Set `wheel_dir` to the download directory. Keep the constraints active while
+installing TokenSpeed so dependency resolution keeps the tested versions.
+
+```bash
+wheel_dir=/path/to/downloaded/wheels
+export PIP_CONSTRAINT="$(mktemp)"
+cat > "$PIP_CONSTRAINT" <<'EOF'
+torch==2.13.0+cpu
+torch-npu==2.13.0
+torchvision==0.28.0+cpu
+compressed-tensors==0.15.0.1
+EOF
+python -m pip install \
+  "$wheel_dir/torch-2.13.0+cpu-cp312-cp312-manylinux_2_28_aarch64.whl" \
+  "$wheel_dir/torch_npu-2.13.0-cp312-cp312-manylinux_2_28_aarch64.whl" \
+  "$wheel_dir/torchvision-0.28.0+cpu-cp312-cp312-manylinux_2_28_aarch64.whl" \
+  compressed-tensors
+```
+
+### Build and install TokenSpeed
 
 Build the TokenSpeed Python runtime, kernel packages, native saver library,
 and `ts-host` from the same checkout. The Ascend saver uses the shared
 memory-control protocol 3 for release and resume. For HTTP control, install
-the matching SMG gateway from the TokenSpeed runtime dependencies. Use an
-activated Python environment with the backported PTA wheel and matching PyTorch
-installed. The Ascend kernel path uses Triton-Ascend 3.2.1 and Transformers
-5.12.0.
-[Ascend kernel setup](https://github.com/yanlonghu/tokenspeed/blob/feat/ascend-acl-graph-memory-saver-review/tokenspeed-kernel-npu/README.md)
-· [Native host package](https://github.com/yanlonghu/tokenspeed/blob/feat/ascend-acl-graph-memory-saver-review/tokenspeed-engine/README.md)
+the matching SMG gateway from the TokenSpeed runtime dependencies. The Ascend
+kernel setup below installs Triton-Ascend 3.2.1, Transformers 5.12.0, and
+`apache-tvm-ffi` 0.1.13.post3.
+[Ascend kernel setup](../../tokenspeed-kernel-npu/README.md)
+· [Native host package](../../tokenspeed-engine/README.md)
 
-From the TokenSpeed checkout, load your CANN environment and build the saver.
-The native library uses CMake 3.18 or later and a C++17 compiler.
+From the TokenSpeed checkout, point `TOKENSPEED_CANN_ROOT` at your installed
+CANN toolkit. The example uses the tested 9.0.0 installation. Build the
+native library with CMake 3.18 or later and a C++17 compiler.
 
 ```bash
-source /usr/local/Ascend/cann-9.0.0/set_env.sh
+export TOKENSPEED_CANN_ROOT=/usr/local/Ascend/cann-9.0.0
+source "$TOKENSPEED_CANN_ROOT/set_env.sh"
 TOKENSPEED_TVM_FFI_VERSION=0.1.13.post3 bash test/ci_system/install_triton_ascend.sh
 TOKENSPEED_KERNEL_BACKEND=npu python -m pip install \
   -e ./tokenspeed-kernel/python ./tokenspeed-engine -e ./python
@@ -48,7 +89,7 @@ export TASK_QUEUE_ENABLE=1 ASCEND_LAUNCH_BLOCKING=0
 Set `TOKENSPEED_HOST_BINARY` to the matching `ts-host` executable if you are
 running from source and the installed executable is from another checkout.
 The saver library must provide ABI 2.
-[Allocator requirements](https://github.com/yanlonghu/tokenspeed/blob/feat/ascend-acl-graph-memory-saver-review/tokenspeed-kernel-npu/memory-saver/README.md)
+[Allocator requirements](../../tokenspeed-kernel-npu/memory-saver/README.md)
 
 ## Start a worker
 
@@ -189,7 +230,7 @@ independent draft weights together. Shared tensors are updated by the target.
   separate qualification requirements.
 - Real-device acceptance tests exercise address preservation, graph replay,
   and per-rank memory accounting. Run them against the stack you will
-  deploy. [Hardware acceptance tests](https://github.com/yanlonghu/tokenspeed/blob/7f89b744f5759bbe5eca22b339a29a9fd535c46c/test/runtime/ascend_memory_saver/README.md)
+  deploy. [Hardware acceptance tests](../../test/runtime/ascend_memory_saver/README.md)
 
 See the [design](../design/ascend-acl-graph-memory-saver.md) for the CUDA
 comparison and how release and recovery work.

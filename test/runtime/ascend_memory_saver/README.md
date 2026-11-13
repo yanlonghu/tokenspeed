@@ -1,9 +1,10 @@
 # Ascend memory saver acceptance tests
 
 These opt-in tests exercise the real Ascend allocator and TokenSpeed serving
-path. Use a supported PTA 2.9 build with the graph-pool allocator ownership
-backports and load the matching CANN environment. The original runs used Atlas
-A2, CANN 9.0.0, and PTA `ee1742b`. Build the saver library with
+path. Use one of the [documented PTA stacks](../../../docs/serving/ascend-memory-saver.md#before-you-start)
+and load its CANN environment. The original runs used Atlas A2, CANN 9.0.0,
+and backported PTA `ee1742b`. The supplemental A2 Docker run used stock
+TorchNPU 2.13.0 with CANN 9.0.0. Build the saver library with
 [the backend instructions](../../../tokenspeed-kernel-npu/memory-saver/README.md).
 When running the Python package from source, use the `ts-host` binary built
 from the same TokenSpeed revision.

@@ -6,9 +6,15 @@ used by the worker. The hardware baseline is Linux aarch64, Atlas A2 (910B3),
 CANN 9.0.0, and PyTorch 2.9.0 with a PTA 2.9.0-730 backport wheel.
 [Ascend setup and usage](../../docs/serving/ascend-memory-saver.md)
 
-## PTA source
+## PTA options
 
-Build the wheel against the deployment's Python, PyTorch C++ ABI, and CANN.
+Stock TorchNPU 2.13.0 contains the six changes listed below. It passed the
+single-host A2 compatibility run with CANN 9.0.0. Ascend's official pairing
+for that release is CANN 9.2.0.
+[Installation and coverage](../../docs/serving/ascend-memory-saver.md#before-you-start)
+
+For PTA 2.9.0-730, build the backport wheel against the deployment's Python,
+PyTorch C++ ABI, and CANN.
 The tested PTA build is `ee1742b06d2c0e59cb0b357288ec29ee190cfd2d`. The public
 snapshot `74e6508b896f630e5d5cacd39a3877047e91c19a` has the same source tree
 `546ac928ce6199c1e2f221d7f5279b4eef6713a8`. The build can report either

@@ -4,6 +4,74 @@ All **25 in-scope acceptance checks passed** on Atlas A2 (Ascend 910B3) with CAN
 
 See the [serving guide](ascend-memory-saver.md) and [design](../design/ascend-acl-graph-memory-saver.md). [Hardware test commands](https://github.com/yanlonghu/tokenspeed/blob/7f89b744f5759bbe5eca22b339a29a9fd535c46c/test/runtime/ascend_memory_saver/README.md)
 
+## Stock TorchNPU 2.13.0 on A2
+
+The published TorchNPU 2.13.0 wheel contains the allocator lifecycle and
+ownership, graph capture ordering and HCCL shutdown changes listed in the
+[2.9.0-730 backport table](#regression-on-the-shared-memory-control-protocol).
+The stock wheel ran the cases below without applying those six backports or
+rebuilding TorchNPU. This is a supplemental compatibility run. The 25-check
+acceptance above used the backported 2.9.0-730 build.
+
+The test used a single Atlas A2 host (910B3, driver 25.5.6), Linux aarch64,
+CPython 3.12.15 and TokenSpeed `7f89b744` (tree
+`fa1d4e74944eab9a8cc04881013411b7f03ca6a1`). The container mounted the
+existing CANN and HCCL 9.0.0 installation read-only and masked the image's
+CANN 9.1.0 and NNAL directories. The import and device probes confirmed the
+loaded library paths. Ascend pairs this TorchNPU release with **CANN 9.2.0**.
+The hardware results in this section apply to CANN 9.0.0 on that A2 host.
+[TorchNPU release metadata](https://api.gitcode.com/api/v5/repos/Ascend/pytorch/releases/tags/v26.2.0-pytorch2.13.0)
+· [Ascend version matrix](https://github.com/Ascend/pytorch/blob/master/COMPATIBILITY.en.md)
+
+Both test environments installed the stock `torch_npu==2.13.0` wheel
+at `c798c6532a0d05c1863489e83cb7e3985be4e830`. The ARM64 CPython 3.12 wheel
+matched the release SHA-256
+`ebb895735bf3c347e8c971c3f9083bb5ec032a1b139876ce019f03ee408d81fa`.
+Most serving tests used
+Ascend's published ARM64 PyTorch `2.13.0+cpu` build. TP4, the initial VMM
+probes, and the targeted pytest suite used the PyTorch project's
+`2.13.0+cpu` build. The serving setup pairs PyTorch with TorchVision
+`0.28.0+cpu`, Transformers `5.12.0`, and Triton-Ascend `3.2.1`.
+The package alignment check and final reruns used Compressed Tensors
+`0.15.0.1`. Replacing legacy TorchVision `0.24.0` resolved the
+`torchvision::nms` startup error. Compressed Tensors `0.15.0.1` removed
+the previous release's Torch upper bound.
+[Install instructions and wheel sources](ascend-memory-saver.md#install-the-stock-2130-packages)
+
+| Check | Result on CANN 9.0.0 |
+| --- | --- |
+| VMM allocator and pool policy | Three release and resume rounds each with normal and paused teardown. The probe verified original virtual addresses, original graph replay, final allocation cleanup, and separate discard, host backup, and resident allocation policies. |
+| TP1, TP2, TP4 and TP8 graph recovery | The Qwen3-0.6B service replayed its original graphs at the original virtual addresses with zero recaptures at all four TP sizes. |
+| Complete weight replacement | TP1 and TP2 disk reload matched fresh starts on the replacement checkpoint. TP2 refused oversized tensors and NPCACHE reload before writes. The local Mooncake TCP Store refreshed both target and dummy MTP draft weights. Both outputs matched a fresh start with the new weights, with 11 verifies per request. |
+| Dummy MTP graph policy | In 100 discard cycles, all 800 requests matched token IDs, verify counts and accepted lengths. The host-backup fallback passed three cycles and 24 requests. |
+| TP2 HCCL and failure handling | Both ranks passed eager collectives, regular ACL Graph replay, VMM-backed graph replay and capture after normal group teardown. The serving tests verified preflight refusal and retry, drain cancellation, and fail-stop after a rank-local error following KV unmap. |
+| Targeted NPU pytest suite | 440 tests and 32 subtests passed. Two tests were skipped. |
+
+The capped GSM8K sample used eight prompts, greedy decoding and a 64-token
+limit. TP2 matched all eight token sequences in each of three pause/resume
+runs and the no-pause control. TP4 and TP8 had four changed sequences each
+after pause. The no-pause controls with Saver enabled had five changes at TP4
+and five and four changes in the two TP8 runs. At the same generated prefix,
+the controls reproduced one of the pause group's first divergences at TP4
+and two at TP8. This run measured token parity and collected no logits.
+The remaining divergences are unassigned. Full GSM8K accuracy, cross-host
+EP/PP, other device families, CANN 9.2.0 hardware, and the open HCCL watchdog
+and failed-group teardown issues were outside this run.
+
+| TP | KV released per rank (MiB) | Weights released per rank (MiB) | Graph backing released per rank (MiB) |
+| --- | ---: | ---: | ---: |
+| 2 | 900 | 638 | 254 |
+| 4 | 450 | 324 | 254 |
+| 8 | 226 | 186 | 254 |
+
+The values count Saver-managed physical pages. For TP2, the three-tag pause
+took 128.24 to 131.15 ms. The two first-use KV wake requests took 5,068.56
+and 5,097.69 ms. Reusing the Triton and TVM caches from the first run reduced
+KV wake to 15.76 ms and total resume including disk reload and commit to
+422.94 ms. The first-use runs generated the KV clear kernel artifacts during
+wake. Cold compilation is the leading explanation for the timing difference.
+These are individual runs on different physical card pairs.
+
 ## Source and test status
 
 ### Regression on the shared memory-control protocol
