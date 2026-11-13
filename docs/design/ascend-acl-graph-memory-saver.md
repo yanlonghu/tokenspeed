@@ -94,7 +94,7 @@ release and resume. The real-device regression overwrites restored graph pages
 before first replay, checks the original graph and addresses, compares tokens
 against a fresh worker, and checks that the graph pool used zero backup bytes.
 [Decode graph data contract](unified_path.md)
-· [Real-device checks](https://github.com/yanlonghu/tokenspeed/blob/feat/ascend-acl-graph-memory-saver-review/test/runtime/ascend_memory_saver/README.md)
+· [Real-device checks](https://github.com/yanlonghu/tokenspeed/blob/7f89b744f5759bbe5eca22b339a29a9fd535c46c/test/runtime/ascend_memory_saver/README.md)
 
 ## Ascend pause, update, and resume
 
@@ -161,7 +161,7 @@ including deployment supervision across hosts.
 Short TP4 and TP8 generation tests also showed token variation without a
 pause. That limits the evidence for token-for-token stability at those sizes.
 [Hardware validation report](../serving/ascend-memory-saver-test-report.md)
-· [Hardware acceptance procedure](https://github.com/yanlonghu/tokenspeed/blob/feat/ascend-acl-graph-memory-saver-review/test/runtime/ascend_memory_saver/README.md)
+· [Hardware acceptance procedure](https://github.com/yanlonghu/tokenspeed/blob/7f89b744f5759bbe5eca22b339a29a9fd535c46c/test/runtime/ascend_memory_saver/README.md)
 
 HCCL TP2 subgroup destruction and graph recapture were measured in a separate
 prototype. The supported path keeps HCCL resident and replays the existing graph.

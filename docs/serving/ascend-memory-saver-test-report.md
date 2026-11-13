@@ -2,12 +2,40 @@
 
 The Ascend Memory Saver release and resume path was exercised on Atlas A2 (Ascend 910B3) with CANN 9.0.0, PyTorch 2.9.0 and the pinned torch_npu 2.9.0-730 backport `ee1742b06d2c0e59cb0b357288ec29ee190cfd2d`. On the tested graph discard path, the worker returned graph-pool physical pages, remapped the original virtual addresses and replayed the original ACL Graph. Qwen3 TP1 and TP2 matched their targeted token references. TP4 and TP8 replayed the original graphs and completed the control calls, with token differences also observed in fresh runs without pause. The generic HCCL watchdog crash and explicit teardown of a failed communicator remain open.
 
-See the [serving guide](ascend-memory-saver.md) and [design](../design/ascend-acl-graph-memory-saver.md). [Hardware test commands](https://github.com/yanlonghu/tokenspeed/blob/feat/ascend-acl-graph-memory-saver-review/test/runtime/ascend_memory_saver/README.md)
+See the [serving guide](ascend-memory-saver.md) and [design](../design/ascend-acl-graph-memory-saver.md). [Hardware test commands](https://github.com/yanlonghu/tokenspeed/blob/7f89b744f5759bbe5eca22b339a29a9fd535c46c/test/runtime/ascend_memory_saver/README.md)
 
 ## Source and test status
 
-The results below predate the stack based on the shared memory-control
-protocol in `f4a807a9`. They describe the tested source trees and hardware.
+### Regression on the shared memory-control protocol
+
+The A2 regression first ran the common patch `f4a807a9` by itself, then
+built the Ascend exit fix and saver at `7f89b744`. The tested tree was
+`fa1d4e74944eab9a8cc04881013411b7f03ca6a1`. Both builds used the pinned
+PTA above and CANN 9.0.0. The combined Linux build passed 161 control,
+79 serving and 28 host tests. Three optional host diagnostics were skipped.
+The targeted A2 pytest suite passed 440 tests and 32 subtests with two skips.
+
+| Check | Combined build result |
+| --- | --- |
+| Distinct checkpoint from disk | TP1 and TP2 matched the two fresh checkpoint B outputs after releasing weights and reloading. TP2 retained parameter addresses and replayed its original graphs. An oversized tensor and an NPCACHE source were refused before writes, and the replica stayed asleep after the failed load. |
+| Short TP2 GSM8K | All eight token sequences matched before and after the transition. The no-pause control also matched 8/8. The test checked both ranks' original graph and virtual addresses, with zero recaptures. All requests reached the 64-token cap. |
+| TP2 refusal, cancellation and device failure | A rank 1 preflight refusal left the mappings intact and a retry succeeded. Cancelling a drain preserved 128 cached tokens on each rank with zero mapping changes. Injecting a rank 1 error after the KV unmap prevented a successful reply and the launcher exited 1. |
+| Graph storage and HCCL | Resumed and paused teardown each passed three VMM rounds. The pool policy probe passed. Both TP2 ranks completed the eager, original graph and VMM graph HCCL probes. |
+| Dummy MTP | In 100 graph-only cycles, all 800 requests matched token IDs, verify counts and acceptance lengths. The full service accepted verify width 5 and rejected width 6 before distributed initialization. |
+| Mooncake | The file fixture and the actual Mooncake TCP Store passed. The TCP fixture refreshed the target and dummy draft with version 2. Both outputs matched a fresh load and each request ran 11 verifies. |
+| TP4 | All four ranks retained the graph and its virtual addresses. The pause and no-pause runs both had 4/8 sequences with token differences. |
+| TP8 | All eight ranks retained the graph and its virtual addresses, with zero recaptures and a clean shutdown. The pause and no-pause runs both had 4/8 sequences with token differences. |
+
+The TP2 short run measured mean TPOT of 9.126 to 9.060 ms and total
+workload time of 5,426.9 to 5,348.4 ms. The three-tag pause, weights and
+graph remap, checkpoint commit, and KV wake took 129.65, 34.36, 424.57,
+and 15.00 ms respectively. Each rank released 900 MiB of KV, 638 MiB of
+weights, and 254 MiB of graph-pool backing. These are control RPC timings
+and allocator accounting, measured with other tests using separate cards.
+
+### Earlier revisions
+
+The following results describe the earlier tested trees and hardware.
 
 | Source | Evidence |
 | --- | --- |
@@ -149,12 +177,7 @@ cargo build --release --locked -p tokenspeed-host --bin ts-host
 
 ## Remaining verification
 
-- Repeat the TP1 disk replacement and TP2 release, checkpoint update, and
-  wake on the stacked runtime. Check that a preflight refusal preserves
-  mappings, a device failure prevents a successful reply, and a successful
-  wake preserves graph addresses and serves tokens from the new checkpoint.
-- Repeat the full-service fixed-width MTP width 5 and width 6 startup pair on the stacked host. The earlier cold-registry run verified that the width 6 rejection precedes distributed initialization.
 - Run full GSM8K against the stacked runtime if full-dataset accuracy and performance are release criteria. Use same-configuration A/A repeats alongside pause and resume, and retain exact token IDs, answer judgments, timing boundaries and cap hits. TP4 and TP8 deterministic token parity remains open.
-- The historical Mooncake test used a synthetic provider and draft. Production provider, multi-rank and cross-host transport, RDMA, and a trained draft with distinguishable proposals remain unverified. Complete native EAGLE3, DFLASH and vanilla DSPARK refresh requires the model-specific checkpoint coverage and in-place derived-state updates. Independent drafter graphs, multi-rank drafting and model-specific DSPARK variants require their own evidence.
-- CUDA and ROCm hardware parity, Atlas A3 and other CANN/PTA versions require device tests. The earlier protocol-2 path and backend boundaries passed CPU and source checks on the Ascend-only integration.
+- The Mooncake tests used a synthetic provider and draft. Production provider, multi-rank and cross-host transport, RDMA, and a trained draft with distinguishable proposals remain unverified. Complete native EAGLE3, DFLASH and vanilla DSPARK refresh requires the model-specific checkpoint coverage and in-place derived-state updates. Independent drafter graphs, multi-rank drafting and model-specific DSPARK variants require their own evidence.
+- CUDA and ROCm hardware parity, Atlas A3 and other CANN/PTA versions require device tests. Protocol 2 compatibility and the backend boundaries passed CPU and source checks on the combined build.
 - Host offload of the ACL Graph executable and HCCL communicator reclamation are outside the integrated feature. Generic watchdog teardown and explicit destroy after peer loss require independent reproductions and lifecycle fixes.

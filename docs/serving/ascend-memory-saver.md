@@ -189,7 +189,7 @@ independent draft weights together. Shared tensors are updated by the target.
   separate qualification requirements.
 - Real-device acceptance tests exercise address preservation, graph replay,
   and per-rank memory accounting. Run them against the stack you will
-  deploy. [Hardware acceptance tests](https://github.com/yanlonghu/tokenspeed/blob/feat/ascend-acl-graph-memory-saver-review/test/runtime/ascend_memory_saver/README.md)
+  deploy. [Hardware acceptance tests](https://github.com/yanlonghu/tokenspeed/blob/7f89b744f5759bbe5eca22b339a29a9fd535c46c/test/runtime/ascend_memory_saver/README.md)
 
 See the [design](../design/ascend-acl-graph-memory-saver.md) for the CUDA
 comparison and how release and recovery work.

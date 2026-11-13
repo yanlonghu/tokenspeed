@@ -389,7 +389,7 @@ communication buffers stay resident. Ordinary captured HCCL operations use the
 preserved virtual addresses with the default `TORCH_HCCL_ZERO_COPY=0`.
 Explicitly registered communication windows have their own resident storage.
 The
-[Ascend acceptance tests](https://github.com/yanlonghu/tokenspeed/blob/feat/ascend-acl-graph-memory-saver-review/test/runtime/ascend_memory_saver/README.md)
+[Ascend acceptance tests](https://github.com/yanlonghu/tokenspeed/blob/7f89b744f5759bbe5eca22b339a29a9fd535c46c/test/runtime/ascend_memory_saver/README.md)
 cover collective replay and per-rank memory accounting. If an Ascend allocator
 transition fails, the serving worker must restart.
 
