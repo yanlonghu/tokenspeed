@@ -1,6 +1,6 @@
 # Ascend ACL Graph Memory Saver test report
 
-The Ascend Memory Saver release and resume path was exercised on Atlas A2 (Ascend 910B3) with CANN 9.0.0, PyTorch 2.9.0 and the pinned torch_npu 2.9.0-730 backport `ee1742b06d2c0e59cb0b357288ec29ee190cfd2d`. On the tested graph discard path, the worker returned graph-pool physical pages, remapped the original virtual addresses and replayed the original ACL Graph. Qwen3 TP1 and TP2 matched their targeted token references. TP4 and TP8 replayed the original graphs and completed the control calls, with token differences also observed in fresh runs without pause. The generic HCCL watchdog crash and explicit teardown of a failed communicator remain open.
+All **25 in-scope acceptance checks passed** on Atlas A2 (Ascend 910B3) with CANN 9.0.0 and PyTorch 2.9.0. The worker released graph-pool physical pages, remapped the original virtual addresses, and replayed the original ACL Graph at TP1, TP2, TP4, and TP8. Qwen3 TP1 and TP2 matched their targeted token references. The remaining four checklist entries are tracked separately and retain their open status. They cover TP4 repeat-run token stability, TP8 repeat-run token stability, the source of the TP4/TP8 numerical drift, and the two HCCL teardown failures grouped under one entry.
 
 See the [serving guide](ascend-memory-saver.md) and [design](../design/ascend-acl-graph-memory-saver.md). [Hardware test commands](https://github.com/yanlonghu/tokenspeed/blob/7f89b744f5759bbe5eca22b339a29a9fd535c46c/test/runtime/ascend_memory_saver/README.md)
 
@@ -9,11 +9,34 @@ See the [serving guide](ascend-memory-saver.md) and [design](../design/ascend-ac
 ### Regression on the shared memory-control protocol
 
 The A2 regression first ran the common patch `f4a807a9` by itself, then
-built the Ascend exit fix and saver at `7f89b744`. The tested tree was
-`fa1d4e74944eab9a8cc04881013411b7f03ca6a1`. Both builds used the pinned
-PTA above and CANN 9.0.0. The combined Linux build passed 161 control,
-79 serving and 28 host tests. Three optional host diagnostics were skipped.
+built the separate Ascend exit fix `939f141f` and saver feature `7f89b744`.
+The tested TokenSpeed tree was `fa1d4e74944eab9a8cc04881013411b7f03ca6a1`.
+The A2 acceptance results are pinned to this stack. Later cross-host changes
+are reviewed on the common protocol branch. The combined Linux build passed
+161 control, 79 serving and 28 host tests. Three optional host diagnostics
+were skipped.
 The targeted A2 pytest suite passed 440 tests and 32 subtests with two skips.
+[Common protocol commit](https://github.com/yanlonghu/tokenspeed/commit/f4a807a99364578037538e9474e0e302bb1d001b) · [Common protocol branch](https://github.com/yanlonghu/tokenspeed/tree/fix/coordinate-memory-transitions) · [Ascend exit fix](https://github.com/yanlonghu/tokenspeed/commit/939f141f300fea99542dd73e551973f8e472408e) · [Tested Saver commit](https://github.com/yanlonghu/tokenspeed/commit/7f89b744f5759bbe5eca22b339a29a9fd535c46c)
+
+The TokenSpeed base `c4551962` includes early rank failure notification and
+GPU-only Memory Saver dependency packaging. The Ascend feature uses the
+shared protocol 3 supplied by the separate common commit.
+[TokenSpeed #3306](https://github.com/lightseekorg/tokenspeed/pull/3306) · [TokenSpeed #3310](https://github.com/lightseekorg/tokenspeed/pull/3310)
+
+The tested `torch_npu` build was `ee1742b06d2c0e59cb0b357288ec29ee190cfd2d`,
+based on PTA 2.9.0-730 `9d40ac3a2b3714df7e5d164bda28a42eff3282cd`.
+The combined public backport commit `74e6508b896f630e5d5cacd39a3877047e91c19a`
+has the same source tree, `546ac928ce6199c1e2f221d7f5279b4eef6713a8`.
+[PTA 2.9.0-730 base](https://gitcode.com/Ascend/pytorch/commit/9d40ac3a2b3714df7e5d164bda28a42eff3282cd?ref=v2.9.0-7.3.0) · [Combined backport MR](https://gitcode.com/Huyanlong/pytorch/merge_requests/1)
+
+| Backport order | Change | Ascend PTA PR and upstream commit |
+| --- | --- | --- |
+| 1 | MemPool allocation lifecycle | [!39221](https://gitcode.com/Ascend/pytorch/merge_requests/39221) · [206b857b](https://gitcode.com/Ascend/pytorch/commit/206b857b23e71a1c075f2dec08c7cc388831a4f3) |
+| 2 | MemPool allocator ownership | [!45270](https://gitcode.com/Ascend/pytorch/merge_requests/45270) · [49b82978](https://gitcode.com/Ascend/pytorch/commit/49b829786c01167b9c0c9e5fdb39cdc9371c44d1) |
+| 3 | ProcessGroupHCCL shutdown override | [!30625](https://gitcode.com/Ascend/pytorch/merge_requests/30625) · [008ecc50](https://gitcode.com/Ascend/pytorch/commit/008ecc509dcd732ca6371a95f9c35f19bb459aa8) |
+| 4 | Synchronize the group's streams during HCCL shutdown | [!32154](https://gitcode.com/Ascend/pytorch/merge_requests/32154) · [f556a8fe](https://gitcode.com/Ascend/pytorch/commit/f556a8fe1841ed19f31425ae41a70bd6dbc31351) |
+| 5 | Order cross-stream events during ACL Graph capture | [!32564](https://gitcode.com/Ascend/pytorch/merge_requests/32564) · [f5f473ee](https://gitcode.com/Ascend/pytorch/commit/f5f473eefd53022c1a2ab0d1d52074b622cd4542) |
+| 6 | Remove the HCCL pending-event wait before graph capture | [!38431](https://gitcode.com/Ascend/pytorch/merge_requests/38431) · [294b8845](https://gitcode.com/Ascend/pytorch/commit/294b8845558d13753d692da9c528102c788f818d) |
 
 | Check | Combined build result |
 | --- | --- |
@@ -23,8 +46,8 @@ The targeted A2 pytest suite passed 440 tests and 32 subtests with two skips.
 | Graph storage and HCCL | Resumed and paused teardown each passed three VMM rounds. The pool policy probe passed. Both TP2 ranks completed the eager, original graph and VMM graph HCCL probes. |
 | Dummy MTP | In 100 graph-only cycles, all 800 requests matched token IDs, verify counts and acceptance lengths. The full service accepted verify width 5 and rejected width 6 before distributed initialization. |
 | Mooncake | The file fixture and the actual Mooncake TCP Store passed. The TCP fixture refreshed the target and dummy draft with version 2. Both outputs matched a fresh load and each request ran 11 verifies. |
-| TP4 | All four ranks retained the graph and its virtual addresses. The pause and no-pause runs both had 4/8 sequences with token differences. |
-| TP8 | All eight ranks retained the graph and its virtual addresses, with zero recaptures and a clean shutdown. The pause and no-pause runs both had 4/8 sequences with token differences. |
+| TP4 | All four ranks completed release and resume and replayed the original graphs at the original addresses, with zero recaptures. |
+| TP8 | All eight ranks completed release and resume and replayed the original graphs at the original addresses, with zero recaptures and a clean shutdown. |
 
 The TP2 short run measured mean TPOT of 9.126 to 9.060 ms and total
 workload time of 5,426.9 to 5,348.4 ms. The three-tag pause, weights and
@@ -32,6 +55,52 @@ graph remap, checkpoint commit, and KV wake took 129.65, 34.36, 424.57,
 and 15.00 ms respectively. Each rank released 900 MiB of KV, 638 MiB of
 weights, and 254 MiB of graph-pool backing. These are control RPC timings
 and allocator accounting, measured with other tests using separate cards.
+
+### TP4 and TP8 numerical attribution
+
+The control used the tested stack, the same physical cards at each TP size,
+the same Qwen3-0.6B BF16 checkpoint and prompt token IDs, and the same serving
+flags apart from the Saver enable flag and its weight policy. Each worker ran
+three A/A pairs of eight GSM8K prompts at batch size one with greedy decoding
+and a 64-token cap. A/A compares two runs of the same prompts without an
+intervening transition. The Saver-disabled workers kept ordinary ACL Graph
+capture and replay. Logs confirmed replay on every rank and no Saver transitions.
+
+| TP | Saver off A/A | Saver on A/A | Pause and resume | Saver off A/A with logits | Saver on A/A with logits | Pause and resume with logits |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 15/24 | 14/24 | 10/24 | 8/24 | 10/24 | 12/24 |
+| 8 | 12/24 | 12/24 | 13/24 | 9/24 | 10/24 | 12/24 |
+
+Each count gives the number of changed output sequences across 24 paired
+requests. The first Saver-on A/A round preceded any pause on that worker.
+Later rounds reused a worker that had already completed a transition. The
+logits probe retained the output tensor and synchronized to copy scores to
+the host. Use the uninstrumented columns for observed token variability.
+
+| TP | Saver off prompts with first-round prefill logit drift | First-round prefill MAE, Saver off / on | Identical-prefix MAE, Saver off / on / after a transition |
+| --- | ---: | ---: | ---: |
+| 4 | 8/8 | 0.099210 / 0.099144 | 0.065058 / 0.065585 / 0.065505 |
+| 8 | 8/8 | 0.089466 / 0.088509 | 0.066580 / 0.067598 / 0.066933 |
+
+The first-round drift was visible in eager prefill before the first decode
+graph replay for each request. The identical-prefix comparison includes the
+first differing token and covers the full vocabulary. All 6,144 reconstructed
+argmax results in the Saver-disabled runs matched the emitted tokens. Across
+TP4 and TP8, those runs reproduced all five distinct historical pause-group
+divergences at the same question, generated prefix, token position, and
+candidate pair. This includes question 5 at token 30 with candidates 304 and 817.
+
+These controls establish that the observed divergences can occur with Saver
+disabled. The two repeat-run stability entries and the operator-level drift
+investigation remain open under Ascend inference numerics. The three paired
+rounds leave smaller incremental effects unquantified. The short capped
+workload measures sequence and logit parity.
+
+The first native TP4 wrapper returned 1 after a completed test because its
+post-run check used the wrong graph flag name. The same run's original logs
+confirmed `enable_memory_saver=False`, `enforce_eager=False`, graph replay
+and clean exit on all four ranks, and idle devices afterward. The other
+three Saver-disabled wrappers returned 0.
 
 ### Earlier revisions
 
@@ -177,7 +246,7 @@ cargo build --release --locked -p tokenspeed-host --bin ts-host
 
 ## Remaining verification
 
-- Run full GSM8K against the stacked runtime if full-dataset accuracy and performance are release criteria. Use same-configuration A/A repeats alongside pause and resume, and retain exact token IDs, answer judgments, timing boundaries and cap hits. TP4 and TP8 deterministic token parity remains open.
+- Full-dataset GSM8K accuracy and performance on the stacked runtime remain outside the short recovery checks. TP4 and TP8 deterministic token parity and the source of the prefill drift are tracked under Ascend inference numerics.
 - The Mooncake tests used a synthetic provider and draft. Production provider, multi-rank and cross-host transport, RDMA, and a trained draft with distinguishable proposals remain unverified. Complete native EAGLE3, DFLASH and vanilla DSPARK refresh requires the model-specific checkpoint coverage and in-place derived-state updates. Independent drafter graphs, multi-rank drafting and model-specific DSPARK variants require their own evidence.
 - CUDA and ROCm hardware parity, Atlas A3 and other CANN/PTA versions require device tests. Protocol 2 compatibility and the backend boundaries passed CPU and source checks on the combined build.
-- Host offload of the ACL Graph executable and HCCL communicator reclamation are outside the integrated feature. Generic watchdog teardown and explicit destroy after peer loss require independent reproductions and lifecycle fixes.
+- Host offload of the ACL Graph executable and HCCL communicator reclamation are outside the integrated feature. The HCCL watchdog crash and explicit destroy after peer loss remain open under Ascend distributed teardown. The default Saver path keeps the HCCL communicator resident.
