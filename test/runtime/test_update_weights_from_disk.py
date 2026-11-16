@@ -36,6 +36,7 @@ import json
 import os
 import sys
 import tempfile
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -50,12 +51,29 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from test.runtime.test_qwen3_weight_discard import (  # noqa: E402
+    checkpoint as qwen3_checkpoint,
+)
+from test.runtime.test_qwen3_weight_discard import (  # noqa: E402
+    make_config as make_qwen3_config,
+)
+from test.runtime.test_qwen3_weight_discard import (  # noqa: E402
+    make_model as make_qwen3_model,
+)
+
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
+from tokenspeed.runtime.distributed.process_group_manager import (  # noqa: E402
+    process_group_manager as pg_manager,
+)
 from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
     UpdateWeightFromDiskReqInput,
 )
+from tokenspeed.runtime.execution.ascend_memory_saver_device import (  # noqa: E402
+    AscendMemorySaverDeviceHandle,
+)
 from tokenspeed.runtime.execution.device import DeviceHandle  # noqa: E402
 from tokenspeed.runtime.execution.model_runner import ModelRunner  # noqa: E402
+from tokenspeed.runtime.execution.weight_memory import WeightMemoryState  # noqa: E402
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod  # noqa: E402
 from tokenspeed.runtime.layers.dense.unquant import (  # noqa: E402
     UnquantizedLinearMethod,
@@ -68,6 +86,7 @@ from tokenspeed.runtime.layers.linear import (  # noqa: E402
 from tokenspeed.runtime.layers.moe.expert import MoELayer  # noqa: E402
 from tokenspeed.runtime.model_loader import loader as loader_module  # noqa: E402
 from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MoE  # noqa: E402
+from tokenspeed.runtime.models.qwen3 import Qwen3ForCausalLM  # noqa: E402
 
 
 class _TinyModel(torch.nn.Module):
@@ -87,6 +106,10 @@ class _TinyModel(torch.nn.Module):
 
 
 class _SelectedFileModel(_TinyModel):
+    checkpoint_weight_files = ("draft.safetensors",)
+
+
+class _SelectedFileQwen3(Qwen3ForCausalLM):
     checkpoint_weight_files = ("draft.safetensors",)
 
 
@@ -115,6 +138,8 @@ def _runner(model: torch.nn.Module, booted_from: Path) -> ModelRunner:
         model_path=str(booted_from), mapping=runner.mapping
     )
     runner.server_args = SimpleNamespace(
+        enable_memory_saver=False,
+        weight_memory_policy=None,
         load_format="auto",
         download_dir=None,
         ext_yaml=None,
@@ -136,6 +161,240 @@ def _device_handle(runner, drafter=None) -> DeviceHandle:
     return handle
 
 
+_Q_PROJ = "model.layers.0.self_attn.q_proj.weight"
+
+
+def _write_qwen3_checkpoint(directory, tensors, file_format):
+    directory.mkdir()
+    if file_format in ("bin", "pt"):
+        torch.save(tensors, directory / f"pytorch_model.{file_format}")
+    else:
+        save_file(tensors, str(directory / "model.safetensors"))
+
+
+def _ascend_saver_handle(model, startup, policy, monkeypatch):
+    runner = _runner(model, startup)
+    runner.device = "npu"
+    runner.server_args.enable_memory_saver = True
+    runner.server_args.weight_memory_policy = policy
+    monkeypatch.setattr(
+        torch, "npu", SimpleNamespace(synchronize=lambda _: None), raising=False
+    )
+    # Only device capability and synchronization need an accelerator here.
+    with mock.patch.object(type(model), "supports_weight_discard", True):
+        state = WeightMemoryState(policy=policy, models=[model])
+    state.mark_kv_released()
+    executor = _device_handle(runner)._executor
+    executor.device = "cpu"
+    handle = AscendMemorySaverDeviceHandle(executor, weight_memory=state)
+    return handle, runner, state
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda", "npu"])
+@pytest.mark.parametrize("file_format", ["safetensors", "bin", "pt"])
+def test_backup_partial_disk_update_preserves_omitted_parameters(
+    tmp_path, monkeypatch, device, file_format
+):
+    model = make_qwen3_model(tied=True)
+    source = qwen3_checkpoint()
+    model.load_weights(source.items())
+    before = {
+        name: parameter.detach().clone() for name, parameter in model.named_parameters()
+    }
+    pointers = [parameter.data_ptr() for parameter in model.parameters()]
+    if device == "npu":
+        handle, runner, state = _ascend_saver_handle(
+            model, tmp_path, "cpu_backup", monkeypatch
+        )
+    else:
+        runner = _runner(model, tmp_path)
+        runner.device = device
+        handle = _device_handle(runner)
+        state = WeightMemoryState(policy="cpu_backup", models=[model])
+        handle._weight_memory = state
+        if device == "cuda":
+            monkeypatch.setattr(torch.cuda, "synchronize", lambda _: None)
+    name = "model.embed_tokens.weight"
+    update = tmp_path / "partial"
+    _write_qwen3_checkpoint(update, {name: source[name] * 2}, file_format)
+    request = UpdateWeightFromDiskReqInput(
+        model_path=str(update),
+        load_format="pt" if file_format == "pt" else None,
+        weight_version="step-2",
+    )
+    ready, reason = handle.check_weight_update(request)
+    assert ready, reason
+    ok, message = handle.update_weights(request)
+    assert ok, message
+    assert not state.valid and state.updating and not state.failed
+    handle.commit_weight_update(True)
+    state.require_usable()
+    assert not state.updating and not model._weight_update_active
+    assert [parameter.data_ptr() for parameter in model.parameters()] == pointers
+    for parameter_name, parameter in model.named_parameters():
+        expected = before[parameter_name] * (2 if parameter_name == name else 1)
+        torch.testing.assert_close(parameter, expected)
+
+
+@pytest.mark.parametrize("policy", ["cpu_backup", "discard"])
+def test_ascend_saver_auto_reads_only_explicit_checkpoint_files(
+    tmp_path, monkeypatch, policy
+):
+    model = _SelectedFileQwen3(make_qwen3_config(tied=True), Mapping(rank=0))
+    source = qwen3_checkpoint()
+    model.load_weights(source.items())
+    before = [parameter.detach().clone() for parameter in model.parameters()]
+    pointers = [parameter.data_ptr() for parameter in model.parameters()]
+    update = tmp_path / "update"
+    _write_qwen3_checkpoint(update, {"unrelated": torch.zeros(1)}, "safetensors")
+    torch.save({"unrelated": torch.zeros(1)}, update / "pytorch_model.bin")
+    (update / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"unrelated": "model.safetensors"}})
+    )
+    save_file(
+        {name: value * 2 for name, value in source.items()},
+        str(update / "draft.safetensors"),
+    )
+    handle, runner, state = _ascend_saver_handle(model, tmp_path, policy, monkeypatch)
+    ok, message = handle.update_weights(
+        UpdateWeightFromDiskReqInput(model_path=str(update), weight_version="step-2")
+    )
+    assert ok, message
+    handle.commit_weight_update(True)
+    assert state.valid and not state.failed
+    assert [parameter.data_ptr() for parameter in model.parameters()] == pointers
+    for parameter, previous in zip(model.parameters(), before, strict=True):
+        torch.testing.assert_close(parameter, previous * 2)
+
+
+@pytest.mark.parametrize("policy", ["cpu_backup", "discard"])
+def test_ascend_saver_auto_ignores_training_files_and_inactive_pt(
+    tmp_path, monkeypatch, policy
+):
+    source = qwen3_checkpoint()
+    update = tmp_path / "update"
+    _write_qwen3_checkpoint(update, source, "safetensors")
+    for name in (
+        "training_args.bin",
+        "optimizer.bin",
+        "optimizer.pt",
+        "scheduler.pt",
+        "other.pt",
+    ):
+        torch.save({"unused": torch.zeros(1)}, update / name)
+    model = make_qwen3_model(tied=True)
+    handle, runner, state = _ascend_saver_handle(model, tmp_path, policy, monkeypatch)
+    ok, message = handle.update_weights(
+        UpdateWeightFromDiskReqInput(model_path=str(update))
+    )
+    assert ok, message
+    handle.commit_weight_update(True)
+    assert runner.model_config.model_path == str(update)
+    assert state.valid and not state.failed
+
+
+def _check_disk_refusal_on_rank(rank, root):
+    root = Path(root)
+    dist = torch.distributed
+    dist.init_process_group(
+        "gloo",
+        init_method=(root / "rendezvous").as_uri(),
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        mapping = Mapping(rank=rank, world_size=2)
+        pg_manager.register_process_group("gloo", mapping.world_group, dist.group.WORLD)
+        model = make_qwen3_model(tied=True, mapping=mapping)
+        source = qwen3_checkpoint()
+        model.load_weights(source.items())
+        runner = _runner(model, root / "startup")
+        runner.device = "npu"
+        runner.server_args.enable_memory_saver = True
+        runner.server_args.weight_memory_policy = "discard"
+        runner.mapping = runner.model_config.mapping = mapping
+        handle = AscendMemorySaverDeviceHandle.__new__(AscendMemorySaverDeviceHandle)
+        handle._executor = _device_handle(runner)._executor
+        with mock.patch.object(type(model), "supports_weight_discard", True):
+            state = WeightMemoryState(policy="discard", models=[model])
+        handle._weight_memory = state
+        state.mark_kv_released()
+        request = UpdateWeightFromDiskReqInput(
+            model_path=str(root / f"rank-{rank}"), weight_version="step-2"
+        )
+        with mock.patch.object(
+            torch, "npu", SimpleNamespace(synchronize=lambda _: None), create=True
+        ):
+            ok, message = handle.update_weights(request)
+        assert not ok, message
+        if rank == 0:
+            assert "group rank 1" in message
+        handle.commit_weight_update(False)
+        assert not state.valid and not state.updating and state.failed
+        with pytest.raises(RuntimeError, match="restart"):
+            handle.before_kv_resume()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo required")
+@pytest.mark.parametrize("failure", ["missing-source", "missing-file"])
+def test_ascend_complete_disk_reload_converges_load_errors_before_commit(
+    tmp_path, failure
+):
+    (tmp_path / "startup").mkdir()
+    update = {name: value * 2 for name, value in qwen3_checkpoint().items()}
+    _write_qwen3_checkpoint(tmp_path / "rank-0", update, "bin")
+    if failure == "missing-source":
+        del update[_Q_PROJ]
+        _write_qwen3_checkpoint(tmp_path / "rank-1", update, "bin")
+    torch.multiprocessing.spawn(
+        _check_disk_refusal_on_rank, args=(str(tmp_path),), nprocs=2
+    )
+
+
+@pytest.mark.parametrize("file_format", ["safetensors", "bin", "pt"])
+@pytest.mark.parametrize("missing_source", [False, True])
+def test_ascend_disk_discard_requires_a_complete_stream(
+    tmp_path, monkeypatch, file_format, missing_source
+):
+    model = make_qwen3_model(tied=True)
+    source = qwen3_checkpoint()
+    model.load_weights(source.items())
+    handle, runner, state = _ascend_saver_handle(
+        model, tmp_path, "discard", monkeypatch
+    )
+    addresses = [parameter.data_ptr() for parameter in model.parameters()]
+    state.release(
+        lambda: [parameter.data.fill_(float("nan")) for parameter in model.parameters()]
+    )
+    state.resume(lambda: None)
+    update = {name: value * 2 for name, value in source.items()}
+    if missing_source:
+        del update[_Q_PROJ]
+    checkpoint_path = tmp_path / "update"
+    _write_qwen3_checkpoint(checkpoint_path, update, file_format)
+    ok, message = handle.update_weights(
+        UpdateWeightFromDiskReqInput(
+            model_path=str(checkpoint_path),
+            load_format="pt" if file_format == "pt" else None,
+        )
+    )
+    assert ok is not missing_source, message
+    handle.commit_weight_update(ok)
+    if missing_source:
+        assert "missing checkpoint weights" in message
+        with pytest.raises(RuntimeError, match="restart"):
+            state.require_usable()
+    else:
+        state.require_usable()
+        torch.testing.assert_close(
+            model.model.embed_tokens.weight, source["model.embed_tokens.weight"] * 2
+        )
+        assert [parameter.data_ptr() for parameter in model.parameters()] == addresses
+
+
 class TestDeviceRouting:
     def test_disk_request_reaches_the_model_runner(self):
         runner = mock.Mock()
@@ -144,6 +403,28 @@ class TestDeviceRouting:
 
         assert (_device_handle(runner).update_weights(req)) == ((True, "ok"))
         runner.update_weights_from_disk.assert_called_once_with(req)
+
+    def test_ascend_discard_disk_load_uses_the_complete_update_transaction(self):
+        from tokenspeed.runtime.execution.ascend_memory_saver_device import (
+            AscendMemorySaverDeviceHandle,
+        )
+
+        runner = mock.Mock()
+        runner.update_weights_from_disk.return_value = (True, "ok")
+        handle = AscendMemorySaverDeviceHandle.__new__(AscendMemorySaverDeviceHandle)
+        handle._executor = _device_handle(runner)._executor
+        handle._weight_memory = state = mock.Mock(
+            policy="discard", models=[runner.model]
+        )
+        state.begin_update.return_value = True
+        req = UpdateWeightFromDiskReqInput(model_path="/ckpt")
+
+        assert handle.update_weights(req) == (True, "ok")
+        runner.update_weights_from_disk.assert_called_once_with(req)
+        state.finish_update.assert_called_once_with(success=True)
+        state.commit_update.assert_not_called()
+        handle.commit_weight_update(True)
+        state.commit_update.assert_called_once_with(True)
 
     def test_drafter_is_told_the_target_weights_changed(self):
         runner = mock.Mock()
@@ -698,6 +979,46 @@ class TestReloadMatchesStartupLoad:
         runner.checkpoint_load_group = (0, 1)
 
         assert (self._groups_read(runner, self.root / "step-1")) == ([(0, 2)])
+
+
+@pytest.mark.parametrize("policy", ["cpu_backup", "discard"])
+def test_ascend_disk_refresh_draft_guard_applies_only_to_discard(
+    tmp_path, monkeypatch, policy
+):
+    target, draft = make_qwen3_model(tied=True), make_qwen3_model(tied=True)
+    source = qwen3_checkpoint()
+    for model in (target, draft):
+        model.load_weights(source.items())
+    target_before = [parameter.detach().clone() for parameter in target.parameters()]
+    draft_before = [parameter.detach().clone() for parameter in draft.parameters()]
+    update = tmp_path / "update"
+    _write_qwen3_checkpoint(
+        update, {name: value * 2 for name, value in source.items()}, "bin"
+    )
+    handle, _, _ = _ascend_saver_handle(target, tmp_path, policy, monkeypatch)
+    with mock.patch.object(type(target), "supports_weight_discard", True):
+        handle._weight_memory = state = WeightMemoryState(
+            policy=policy, models=[target, draft]
+        )
+    state.mark_kv_released()
+    request = UpdateWeightFromDiskReqInput(
+        model_path=str(update), weight_version="step-2"
+    )
+    ready, message = handle.check_weight_update(request)
+    assert ready is (policy == "cpu_backup"), message
+    ok, message = handle.update_weights(request)
+    assert ok is (policy == "cpu_backup"), message
+    if policy == "discard":
+        assert "restore the discarded target and refresh draft together" in message
+        assert state.valid and not state.failed and not state.updating
+        assert state.local_update_success is None
+    else:
+        handle.commit_weight_update(True)
+        state.require_usable()
+    for parameter, previous in zip(target.parameters(), target_before, strict=True):
+        torch.testing.assert_close(parameter, previous * (2 if ok else 1))
+    for parameter, previous in zip(draft.parameters(), draft_before, strict=True):
+        torch.testing.assert_close(parameter, previous)
 
 
 if __name__ == "__main__":
