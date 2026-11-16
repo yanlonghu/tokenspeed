@@ -55,7 +55,22 @@ storage, owned PTA pool IDs and native spans; the report separates persistent
 buffer backup from parameter discard and independent draft backup bytes.
 Use each program's `--help` for supported execution and negative-control options.
 
-Extended ModelUpdater file/TCP publication, snapshots, paired draft refresh and
-trace-diagnostic test matrices are maintained separately from these core smoke
-programs. Follow the guide's
+## Fork-only extensions
+
+This validation branch supplements the core NPU feature in PR #3406. It restores
+host-identity and ownership diagnostics plus optional ModelUpdater file/TCP,
+snapshot and paired draft-refresh smoke combinations. They are excluded from
+the upstream feature diff.
+
+```bash
+python -m pytest "$suite/test_trace_host_identity.py" \
+  "$suite/test_weight_ownership.py"
+```
+
+The extended weight smoke accepts `--mooncake-fixture`, `--snapshot`,
+`--verify-namespace` and `--updated-draft`. Add `--store-master 127.0.0.1:PORT`
+only for an owned test master. This fixture does not qualify a production SDK,
+RDMA or cross-node serving. Run `--help` and follow the guide's
 [update and failure rules](../../../docs/serving/ascend-memory-saver.md#one-checkpoint-cycle).
+Extended hardware combinations are not new-source passes unless separately
+recorded with their source and environment.

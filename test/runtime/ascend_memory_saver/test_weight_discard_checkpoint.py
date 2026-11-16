@@ -22,6 +22,7 @@
 """Verify a complete Ascend checkpoint replacement after weight discard."""
 
 import argparse
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -46,6 +47,7 @@ def run(args, report):
         ReleaseMemoryOccupationReqInput,
         ResumeMemoryOccupationReqInput,
         UpdateWeightFromDiskReqInput,
+        UpdateWeightsFromMooncakeReqInput,
     )
     from tokenspeed.runtime.entrypoints.wire_driver import WireDriver, generate_request
 
@@ -68,8 +70,14 @@ def run(args, report):
         **trace_environment(trace_path),
     }
 
-    draft_policy = "retain"
+    draft_policy = "refresh" if args.updated_draft is not None else "retain"
+    sdk_directory = args.output_dir.resolve() / "sdk"
     version = 2
+    snapshot = {"version": version} if args.snapshot or args.store_master else None
+    sdk_config = {
+        "directory": str(sdk_directory),
+        "expect_snapshot": snapshot is not None,
+    }
     ambiguous_checkpoint = args.output_dir.resolve() / "ambiguous-auto"
     if args.verify_disk_format_preflight:
         ambiguous_checkpoint.mkdir()
@@ -88,6 +96,45 @@ def run(args, report):
         (ambiguous_checkpoint / "pytorch_model.bin").write_text(
             "Ambiguous checkpoint family marker; do not deserialize.\n"
         )
+    publisher = None
+    if args.mooncake_fixture:
+        checkpoints = {"target": args.incomplete or args.updated}
+        if args.updated_draft is not None:
+            checkpoints["draft"] = args.updated_draft
+        if args.store_master:
+            from mooncake_sdk_fixture import open_store
+            from safetensors import safe_open
+            from safetensors.torch import save
+
+            sdk_config["master"] = args.store_master
+            publisher = open_store("127.0.0.1", args.store_master, 2 << 30)
+            objects = {}
+            for role, directory in checkpoints.items():
+                keys = []
+                with safe_open(
+                    directory / "model.safetensors", framework="pt", device="cpu"
+                ) as checkpoint:
+                    for index, name in enumerate(checkpoint.keys()):
+                        key = f"weights-fixture-{os.getpid()}-{version}-{role}-{index}"
+                        result = publisher.put(
+                            key, save({name: checkpoint.get_tensor(name)})
+                        )
+                        require(
+                            result == 0,
+                            f"Failed to publish fixture weight {name}: {result}",
+                        )
+                        keys.append(key)
+                objects[role] = keys
+            snapshot["fixture_objects"] = objects
+        else:
+            for role, directory in checkpoints.items():
+                link = sdk_directory / f"version-{version}" / role
+                link.parent.mkdir(parents=True, exist_ok=True)
+                link.symlink_to(directory.resolve(), target_is_directory=True)
+        report["transport"] = (
+            "mooncake-tcp-fixture" if publisher is not None else "file-sdk-fixture"
+        )
+        report["draft_policy"] = draft_policy
 
     def launch(model, policy, trace=False):
         launch_args = make_server_args(
@@ -101,21 +148,46 @@ def run(args, report):
         )
         launch_args[launch_args.index("--weight-memory-policy") + 1] = policy
         if args.draft is not None:
+            draft = (
+                (args.updated_draft or args.draft)
+                if policy == "reference"
+                else args.draft
+            )
             launch_args.extend(
                 (
                     "--speculative-algorithm",
                     "MTP",
                     "--speculative-draft-model-path",
-                    str(args.draft),
+                    str(draft),
                     "--speculative-num-steps",
                     "1",
                     "--speculative-num-draft-tokens",
                     "2",
                 )
             )
-            if policy == "discard":
+            if policy == "discard" and not args.mooncake_fixture:
                 launch_args.extend(("--model-update-draft-weights", draft_policy))
-        if args.verify_cache_flush:
+        if args.mooncake_fixture and policy != "reference":
+            launch_args.extend(
+                (
+                    "--model-update-config",
+                    json.dumps(
+                        {
+                            "weight_store_config": sdk_config,
+                            "local_host": "127.0.0.1",
+                            "hf_type": "qwen3",
+                            "hf_safetensors_path": str(args.initial),
+                        }
+                    ),
+                    "--model-update-sdk-module",
+                    "mooncake_sdk_fixture",
+                    "--model-update-engine-type",
+                    "fluent_llm",
+                    "--model-update-draft-weights",
+                    draft_policy,
+                )
+            )
+        if args.verify_namespace or args.verify_cache_flush:
             launch_args.remove("--disable-kvstore")
             launch_args.remove("--disable-prefix-caching")
             launch_args.extend(
@@ -137,7 +209,11 @@ def run(args, report):
             num_engines=1,
             routing="round_robin",
             startup_timeout_s=150,
-            env=env if trace else None,
+            env=(
+                env
+                if trace or (args.mooncake_fixture and policy != "reference")
+                else None
+            ),
         )
 
     def infer(driver):
@@ -164,6 +240,13 @@ def run(args, report):
         return [out["ids"] for out in outputs]
 
     def weight_update(*, flush_cache=True):
+        if args.mooncake_fixture:
+            return UpdateWeightsFromMooncakeReqInput(
+                version=version,
+                flush_cache=flush_cache,
+                weight_version=None,
+                snapshot=snapshot,
+            )
         return UpdateWeightFromDiskReqInput(
             model_path=str(args.incomplete or args.updated),
             load_format="auto" if args.verify_disk_format_preflight else None,
@@ -190,11 +273,45 @@ def run(args, report):
                 len(sleeping) == 1 and sleeping[0].is_sleeping,
                 "Engine must stay asleep after refusing the incomplete update",
             )
-            require(
-                "Incomplete checkpoint" in replies[0].message
-                and "nothing was written" in replies[0].message,
-                f"Incomplete checkpoint was not refused before writes: {replies}",
-            )
+            if args.mooncake_fixture:
+                require(
+                    "missing checkpoint weights" in replies[0].message, str(replies)
+                )
+                if args.verify_namespace:
+                    for namespace, expected in (
+                        ("fixture-initial", "restart"),
+                        (str(version), "cannot change without flush_cache"),
+                    ):
+                        replies = driver.control(
+                            UpdateWeightsFromMooncakeReqInput(
+                                version=version,
+                                flush_cache=False,
+                                weight_version=namespace,
+                            )
+                        )
+                        require(
+                            len(replies) == 1
+                            and not replies[0].success
+                            and expected in replies[0].message,
+                            f"Unexpected namespace after failure: {replies}",
+                        )
+                    report["namespace_after_failure"] = "fixture-initial"
+                replies = driver.control(
+                    ResumeMemoryOccupationReqInput(tags=["kv_cache"])
+                )
+                require(
+                    len(replies) == 1
+                    and not replies[0].success
+                    and "restart" in replies[0].message,
+                    f"KV wake must fail after a partial stream: {replies}",
+                )
+                report["kv_wake_refusal"] = replies[0].message
+            else:
+                require(
+                    "Incomplete checkpoint" in replies[0].message
+                    and "nothing was written" in replies[0].message,
+                    f"Incomplete checkpoint was not refused before writes: {replies}",
+                )
         return
 
     with launch(args.updated, "reference") as reference:
@@ -367,6 +484,29 @@ def main():
     parser.add_argument("--updated", type=Path, required=True)
     parser.add_argument("--draft", type=Path)
     parser.add_argument(
+        "--updated-draft",
+        type=Path,
+        help="Refresh an opted-in draft through the SDK fixture",
+    )
+    parser.add_argument(
+        "--mooncake-fixture",
+        action="store_true",
+        help="Use the file-backed Model Updater fixture",
+    )
+    parser.add_argument(
+        "--snapshot",
+        action="store_true",
+        help="Send snapshot metadata to the SDK fixture",
+    )
+    parser.add_argument(
+        "--store-master", help="Use an existing local Mooncake master for the fixture"
+    )
+    parser.add_argument(
+        "--verify-namespace",
+        action="store_true",
+        help="Verify a failed SDK update leaves the in-memory L3 namespace unchanged",
+    )
+    parser.add_argument(
         "--incomplete", type=Path, help="Expect an incomplete checkpoint refusal"
     )
     parser.add_argument(
@@ -382,10 +522,20 @@ def main():
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
+    if (
+        args.updated_draft or args.snapshot or args.store_master
+    ) and not args.mooncake_fixture:
+        parser.error(
+            "--updated-draft, --snapshot and --store-master require --mooncake-fixture"
+        )
+    if args.updated_draft and not args.draft:
+        parser.error("--updated-draft requires --draft")
+    if args.verify_namespace and not (args.mooncake_fixture and args.incomplete):
+        parser.error("--verify-namespace requires --mooncake-fixture and --incomplete")
     if args.verify_cache_flush and args.incomplete:
         parser.error("--verify-cache-flush requires a complete replacement checkpoint")
     if args.verify_disk_format_preflight:
-        if args.incomplete:
+        if args.mooncake_fixture or args.incomplete:
             parser.error(
                 "--verify-disk-format-preflight requires a complete disk replacement"
             )
