@@ -1,0 +1,82 @@
+Packet-only scaffolding; no device execution or publication occurs here.
+
+Tools
+- test_build_public_packet.py: atomic builder with explicit frozen source,
+  separate companion, actual executed helpers, whitelist and privacy policies.
+- test_verify_public_packet.py: offline source/archive/Git-tree/file/receipt gate.
+- test_sanitize_evidence.py: whitelist-only UTF8 literal substitutions; SHA1,
+  SHA256 and numeric JSON values must remain unchanged. No raw archive sanitizing.
+- test_sanitizer_cases.py and test_public_packet_cases.py: CPU behavior/negative tests.
+
+Required inputs
+Copy/fill test_packet_config.example.json OUTSIDE the public packet. Every input
+file path and SHA256 must be explicit. Source manifests use commit, source_tree
+and files (dict or path-record list); rows require mode, git_oid and sha256.
+The core manifest is complete; its files must cryptographically reconstruct the
+stated Git tree and match every source archive path/mode/blob. Git asset images
+may be binary but remain bound to their public source SHA. Source symlinks must
+stay inside the archive. Never use the combined private local review bundle.
+
+The companion manifest selects only the separate public companion test paths;
+every selected file is copied byte-identically to public test/. Its commit/tree
+pin the separate companion Git ref from which the test selection was exported,
+not the merged core. The selected manifest is not a claim to distribute the whole
+companion repository. Core tests
+remain inside the full core source. Additional actual-run helpers must already
+have full MIT headers and carry their actual executed SHA. The builder never
+redacts or adds headers to code while pretending the bytes actually executed.
+Prepare portable licensed helpers BEFORE a new device run when required.
+
+The client tokenspeed_engine._native and worker _host are distinct legitimate
+artifacts. Do not import the worker module into a client with standalone scheduler
+bindings. The validation configuration records their separate actual observations
+and hashes; there is no hardcoded worker module filename in the tools. A worker
+/proc map observer can supply the separate worker receipt without importing it.
+Native source-equivalent reuse needs a proof with from_tree, to_tree and
+production_and_native_inputs_identical=true. Upstream production edits require
+a fresh matching build unless that full input proof actually exists.
+
+Evidence whitelist paths are relative to each group's raw_root. Its public paths
+are relative to evidence/LABEL/; do not repeat the evidence/LABEL prefix. An
+independent NPU group must use kind=independent-npu and
+scope=independent-backend-supplement. Include only bounded aggregate/timing/probe
+material, never the independent Ascend implementation archive or private env.
+An NPU-only result must not be a current common-core hardware receipt.
+
+Private literal-map and deny JSON must remain outside output. Map full private
+run/dependency roots, actual hostnames/corporate endpoints and private wallclock
+dates to generic labels. Keep source/test hashes, token IDs, ACK/rank/count values,
+monotonic time integers and their order unchanged. If creating a public field
+projection, state its parent raw SHA and selected-field lineage; it is not a
+literal-redacted whole-file identity claim. This builder performs only literal
+substitutions on frozen explicitly selected raw files. It does not infer results.
+
+Do not sanitize live/changing logs or relabel the historical frozen13 result as
+the merged source result. publication_ready=false and validation=null are valid
+only for preparation. Before publication, fill the explicit validation section
+from test_validation_config.example.json with fresh source-bound successful
+receipts, zero exits, native artifact pins and actual serving checker inputs.
+No old a034 path counts, graph coverage or test totals are built into the gate.
+
+Commands (CONFIG/MAP/DENY outside PACKET; PACKET must not exist):
+  python test_build_public_packet.py --config CONFIG --output PACKET --private-map MAP --private-deny DENY
+  python test_verify_public_packet.py PACKET --mode preparation --private-deny DENY
+For a fully validated packet only:
+  python test_verify_public_packet.py PACKET --mode publication --private-deny DENY
+CPU selftests:
+  PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s THIS_TEST_DIRECTORY -p 'test_*cases.py' -v
+
+The builder creates FILE-MANIFEST.json, SHA256SUMS and an evidence raw/public hash
+ledger, verifies before atomic rename, and refuses existing output or any failed
+privacy/source/result check. It never pushes, uploads, calls GitHub, changes core
+source, installs dependencies or runs a device test. Archive and anonymous-download
+verification after owner upload remain separate steps.
+
+The verifier executes the hash-checked serving checker without generating its
+bytecode inside the packet. Normal Python CLI use does not require -B or
+PYTHONDONTWRITEBYTECODE; preexisting packet caches remain forbidden.
+
+Acceptance guards use explicit exceptions rather than standalone Python asserts.
+The CPU suite runs positive verification and invalid verifier/builder/sanitizer
+CLIs under both python -O and PYTHONOPTIMIZE=1; optimization does not remove the
+source, publication, privacy or numeric-evidence checks.

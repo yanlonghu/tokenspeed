@@ -1,0 +1,12 @@
+[
+  {
+    "source": "logs/core-runtime-result.json",
+    "public": "logs/core-runtime-result.json",
+    "classification": "current-common-core-actual-run"
+  },
+  {
+    "source": "record/GPU-RESULT.json",
+    "public": "record/GPU-RESULT.json",
+    "classification": "current-common-core-summary"
+  }
+]

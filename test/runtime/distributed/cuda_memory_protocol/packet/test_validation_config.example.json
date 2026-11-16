@@ -1,0 +1,99 @@
+{
+  "tested_core_tree": "FILL_FINAL_MERGED_TREE",
+  "result_receipts": [
+    {
+      "path": "evidence/gpu/record/GPU-RESULT.json",
+      "tree_keys": [
+        "source_tree"
+      ],
+      "status_keys": [
+        "status"
+      ],
+      "success": "passed"
+    }
+  ],
+  "exit_zero": [
+    "evidence/gpu/logs/rust-core.exit",
+    "evidence/gpu/logs/core-runtime.exit",
+    "evidence/gpu/logs/core-serving.exit"
+  ],
+  "native": {
+    "mode": "fresh",
+    "producer_tree": "FILL_FINAL_MERGED_TREE",
+    "receipt": "evidence/gpu/record/NATIVE-PRODUCER.json",
+    "producer_tree_keys": [
+      "source_tree"
+    ],
+    "equivalence": null,
+    "artifacts": [
+      {
+        "role": "client-native",
+        "sha256": "FILL_CLIENT_ARTIFACT_SHA256",
+        "receipt": "evidence/gpu/logs/core-runtime-result.json",
+        "sha_keys": [
+          "native_sha256",
+          "tokenspeed_engine._native"
+        ]
+      },
+      {
+        "role": "worker-host",
+        "sha256": "FILL_WORKER_ARTIFACT_SHA256",
+        "receipt": "evidence/gpu/record/WORKER-DSO-RECEIPT.json",
+        "sha_keys": [
+          "worker_host_sha256"
+        ]
+      }
+    ]
+  },
+  "serving": {
+    "checker": "test/cuda_memory_protocol/test_summarize_cuda_two_node_serving.py",
+    "directories": [
+      "evidence/gpu/logs/serve-flashinfer-ep4-v2",
+      "evidence/gpu/logs/serve-flashinfer-ep4-v2-nccl",
+      "evidence/gpu/logs/serve-flashinfer-dp2-tp2-ep4-v2",
+      "evidence/gpu/logs/serve-flashinfer-dp2-tp2-ep4-v2-nccl"
+    ],
+    "expected_summary": "evidence/gpu/logs/cuda-v2-serving-summary.json"
+  },
+  "executed_helper_receipts": [
+    {
+      "helper": "test/executed/test_run_core_runtime.py",
+      "receipt": "evidence/gpu/logs/core-runtime-result.json",
+      "sha_keys": [
+        "executed_harness_sha256"
+      ]
+    }
+  ],
+  "source_checks": [
+    {
+      "path": "evidence/gpu/logs/source-before-build.json",
+      "tree_keys": [
+        "source_tree"
+      ],
+      "count_keys": [
+        "manifest_paths"
+      ],
+      "status_keys": [
+        "status"
+      ],
+      "errors_keys": [
+        "errors"
+      ]
+    },
+    {
+      "path": "evidence/gpu/logs/source-final.json",
+      "tree_keys": [
+        "source_tree"
+      ],
+      "count_keys": [
+        "manifest_paths"
+      ],
+      "status_keys": [
+        "status"
+      ],
+      "errors_keys": [
+        "errors"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "schema": "public-memory-replay/v1",
+  "publication_ready": false,
+  "qualification_limits": [
+    "Preparation template: no current merged-tree device result is claimed.",
+    "CUDA production remains protocol2 with local ACK semantics.",
+    "No physical cross-host PP/PD transfer-inflight or ROCm device acceptance is implied."
+  ],
+  "core": {
+    "commit": null,
+    "tree": "FILL_FINAL_MERGED_TREE",
+    "archive": "/ABS/FROZEN/core-source.tar.gz",
+    "archive_sha256": "FILL_SHA256",
+    "manifest": "/ABS/FROZEN/core-source-manifest.json",
+    "manifest_sha256": "FILL_SHA256"
+  },
+  "companion": {
+    "commit": "FILL_PUBLIC_COMPANION_COMMIT",
+    "tree": "FILL_COMPANION_TREE",
+    "manifest": "/ABS/FROZEN/companion-selected-test-manifest.json",
+    "manifest_sha256": "FILL_SHA256",
+    "files": [
+      {
+        "source": "/ABS/FROZEN/test_summarize_cuda_two_node_serving.py",
+        "source_path": "test/runtime/distributed/cuda_memory_protocol/test_summarize_cuda_two_node_serving.py",
+        "public": "test/cuda_memory_protocol/test_summarize_cuda_two_node_serving.py",
+        "sha256": "FILL_SHA256"
+      }
+    ]
+  },
+  "executed_helpers": [
+    {
+      "source": "/ABS/ACTUAL-EXECUTED/test_run_core_runtime.py",
+      "public": "test/executed/test_run_core_runtime.py",
+      "sha256": "FILL_ACTUALLY_EXECUTED_SHA256"
+    }
+  ],
+  "public_files": [
+    {
+      "source": "/ABS/REVIEWED/README.txt",
+      "public": "README.txt",
+      "sha256": "FILL_SHA256",
+      "classification": "public-documentation"
+    },
+    {
+      "source": "/ABS/REVIEWED/test_verify_public_packet.py",
+      "public": "test/test_verify_public_packet.py",
+      "sha256": "FILL_SHA256",
+      "classification": "packet-only-tool"
+    }
+  ],
+  "evidence": [
+    {
+      "label": "gpu",
+      "kind": "common-gpu",
+      "scope": "current-common-core",
+      "raw_root": "/ABS/FINAL-IMMUTABLE-GPU-EVIDENCE",
+      "allow_list": "/ABS/PRIVATE-INPUT/gpu-whitelist.json",
+      "allow_list_sha256": "FILL_SHA256"
+    }
+  ],
+  "validation": null
+}
