@@ -2278,6 +2278,11 @@ the exit — puts them in span order first (`plan.to_span_order`, or the
 sizing (`CommManager`) reads them, a model reads its rows from its tensors or
 `ctx.query_shard`.
 
+A non-tail pipeline stage sends its boundary bundle and returns the same
+five-field executor result: placeholder tokens and lengths, followed by
+three `None` probability outputs. Memory release/resume follows the
+[memory-transition contract](../serving/weight-memory.md#memory-transition-protocol).
+
 Plugin API 4 replaces the contiguous query-shard contract with per-request
 zigzag rows. Plugins must declare support for API 4 after migrating their
 row-layout and request-history consumers; API 3 adapters are incompatible.
