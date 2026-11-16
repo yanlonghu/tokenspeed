@@ -41,6 +41,12 @@ model.
 ``reader_rank`` is the process's global rank: the SDK shards the metadata
 bundles across readers by it, and under attention-DP every rank's TP rank may
 be 0, so only the global rank tells the readers apart.
+
+On Ascend the provider must support CPU or local NPU staging, and deliver
+canonical checkpoint tensors ready for consumption on the loader's stream.
+The provider owns store IO, including the lifetime of reused staging buffers.
+TokenSpeed waits for NPU copies before post-load hooks and for device work
+before reporting success.
 """
 
 from __future__ import annotations
@@ -158,7 +164,20 @@ class ModelUpdateAdapter:
     def update(
         self, models: list[nn.Module], version: int, *, snapshot: dict | None = None
     ) -> str:
-        """Stream one committed version into ``models``.
+        """Stream one version and return the SDK result as text."""
+        return str(self.update_result(models, version, snapshot=snapshot))
+
+    def update_result(
+        self,
+        models: list[nn.Module],
+        version: int,
+        *,
+        snapshot: dict | None = None,
+    ) -> object:
+        """Stream a version and retain the SDK result for Ascend failure checks.
+
+        Ascend must reject an explicit False before post-load hooks. Formatting
+        it as the legacy update reply would lose that failure signal.
 
         Args:
             models: The modules to update, target first. Each receives the
@@ -168,9 +187,8 @@ class ModelUpdateAdapter:
             snapshot: Optional publication metadata passed unchanged to the SDK.
                 Tensor data remains in the selected weight store. Omission keeps
                 the existing version-only SDK call.
-
         Returns:
-            The SDK's result rendered as a string, for the reply message.
+            The SDK's result, for the runner to interpret.
         """
         if snapshot is not None and not isinstance(snapshot, dict):
             raise TypeError("snapshot must be a dictionary or None")
@@ -179,4 +197,4 @@ class ModelUpdateAdapter:
             result = updater.update_weights(models, version=version)
         else:
             result = updater.update_weights(models, version=version, snapshot=snapshot)
-        return str(result)
+        return result

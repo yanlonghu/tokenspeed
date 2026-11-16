@@ -577,6 +577,7 @@ class Eagle3LlamaModel(BaseTransformerModel):
 class LlamaForCausalLMEagle3(BaseCausalLM):
 
     model_cls = Eagle3LlamaModel
+    supports_acl_graph_discard = True
 
     def __init__(
         self,
@@ -743,8 +744,12 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
         if head is not None and self.load_lm_head_from_target:
             del self.lm_head.weight
             self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        if embed.device.type == "npu":
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+        else:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
 
 EntryClass = [LlamaForCausalLMEagle3]

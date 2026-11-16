@@ -109,7 +109,9 @@ def test_bootstrap_preserves_gpu_spacing(monkeypatch):
     )
     host = HostBootstrap.__new__(HostBootstrap)
     with pytest.raises(FileNotFoundError, match="model weights unavailable"):
-        host.__init__(args, None, None, None, None, None)
+        host.__init__(
+            args, None, None, None, None, None, replica_memory_transitions=False
+        )
     assert host._gpu_id == 3
 
 
@@ -298,6 +300,48 @@ def test_spawned_host_inherits_start_context_environment(tmp_path, monkeypatch):
         assert ready["context"] == "configured"
         assert key not in os.environ
     finally:
+        proc.terminate()
+        proc.join(timeout=10)
+
+
+@pytest.mark.parametrize("device", ["cuda", "npu"])
+def test_only_the_npu_launcher_requests_gil_restoration(tmp_path, device):
+    binary = _fake_host(
+        tmp_path,
+        """
+        connection.recv()
+        connection.send({"status": "ready", "args": sys.argv[1:]})
+        time.sleep(600)
+        """,
+    )
+    server_args = ServerArgs(
+        model="x",
+        device=device,
+        disable_prefill_graph=device == "npu",
+        disable_pdl=device == "npu",
+    )
+    server_args.mapping.rank = 0
+    port_args = PortArgs.init_new(server_args)
+    proc, reader = start_rust_host(
+        binary, server_args, port_args, nullcontext(), None, False
+    )
+    try:
+        (ready,) = receive_ready_messages([reader], [proc])
+        args = ready["args"]
+        expected = [
+            "--python",
+            sys.executable,
+            "--control-fd",
+            args[3],
+            "--enable-async-logging",
+            str(server_args.enable_async_logging).lower(),
+        ]
+        assert int(args[3]) >= 0
+        if device == "npu":
+            expected.extend(["--restore-gil-for-exit", "true"])
+        assert args == expected
+    finally:
+        reader.close()
         proc.terminate()
         proc.join(timeout=10)
 
@@ -570,6 +614,7 @@ def _data_plane(handle: DeviceHandle) -> HostDataPlane:
         max_encoder_tokens=None,
         attn_tp_cpu_group=None,
         epd_publisher=None,
+        replica_memory_transitions=False,
         starting=False,
     )
 
