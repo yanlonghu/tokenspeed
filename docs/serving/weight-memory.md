@@ -89,6 +89,12 @@ execution retains those workspaces because captured kernels may refer to them.
 
 ## Allocator runtime requirements
 
+The launcher captures its child environment inside the allocator's launch
+context. An explicitly supplied memory-saver preload is reused once. Parent
+preload libraries keep their relative order, and additional non-saver libraries
+from the launch context are retained. Without an explicit saver preload, the
+context selects the hook and library paths for the child.
+
 The allocator must recognize managed pointers when they are freed outside their
 allocation region, and must separate pools by both tag and CPU-backup policy.
 Some `0.0.9.post1` binaries lack the former fix. Validate clean process shutdown
@@ -131,6 +137,48 @@ A request to resume all regions immediately after discard fails: the new
 weights have not been committed yet. A weight update while KV is resident is
 also rejected under discard. Keep the orchestrator paused on any failed
 response, including a failure in a different serving replica.
+
+## Memory transition protocol
+
+The update-commit version 2 above is unchanged. Checked host/runtime pairs
+select release/resume protocol 3 when the selected allocator backend declares
+coordinated transitions, with `--enable-memory-saver`, excluding encode. Startup
+reads this class capability; the query itself constructs no adapter and performs
+no device initialization. The independent Ascend adapter declares support; CUDA, ROCm and Noop
+adapters do not. Their paths retain
+protocol 2 and its local ACK, graph and NCCL behavior. The existing Gloo address rendezvous rejects
+mixed protocols before the Rust mesh or READY: v2 keeps its plain address,
+and legacy v2 peers reject a tagged v3 address. Prefill and Decode worlds
+agree separately; earlier model/graph initialization flags must also agree.
+
+For v3, fan out the same ordered operation to every participating ingress.
+The domain is the attention-TP/PP replica for independent engines, or the
+existing attention-DP group for shared forwards, including cross-replica EP.
+Direction and canonical tags must match. Send the same optional single-string
+`transition_id` to each engine (`rid` on the direct wire); use fresh IDs per
+operation. Ordered fanout may omit the ID. Success waits for every member's
+device completion; a pre-device refusal leaves mappings unchanged.
+
+`continue_generation` cancels the whole observed pending batch before device
+work, including calls observed in the same gate after continue arrived
+locally. Already released memory stays asleep. The 30-second queue-head
+threshold applies while participants are missing and no earlier release is
+draining: expiry refuses the whole observed batch, including younger calls
+that waited less than 30 seconds. A peer delivery after that gate can reply
+later. Before retrying, collect continue and every outstanding memory reply,
+including late timeout replies; continue success alone does not fence old
+fanout. Pre-device refusals are retryable after that collection. A device
+apply or post-readiness L1-clear failure is fatal to the whole domain,
+including healthy ranks: recover all members before training or serving;
+cross-host supervision remains the deployment's responsibility.
+
+Before a v2 NCCL release, identify every underlying communicator participant
+and fan out matching release/resume operations to all of them. A world
+communicator can span independent DP engines. Use explicit non-NCCL tags to
+manage those engines separately; omitted tags include `nccl` when advertised.
+V3 keeps NCCL resident and rejects explicit `nccl` before releasing any region.
+See the [event-loop invariants](../design/event-loop.md#subsystems-in-detail)
+for matching, drain and preflight ordering.
 
 ## Validation before enabling in a training job
 

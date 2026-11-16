@@ -28,12 +28,14 @@ and scheduler, with a CPU stand-in for the model executor.
 from __future__ import annotations
 
 import os
+import re
 import signal
 import stat
+import subprocess
 import sys
 import textwrap
 import threading
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import msgspec
 import pytest
@@ -46,6 +48,10 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
 from test.l3_test_utils import storage_scheduler  # noqa: E402
+from test.runtime.test_launcher_preload_cases import (  # noqa: E402
+    conflicting_preload_cases,
+    preload_cases,
+)
 
 from tokenspeed_scheduler import (  # noqa: E402
     AttnKind,
@@ -89,6 +95,29 @@ from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs  # noqa: E
 # ----------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("options", [[], ["--enable-async-logging", "invalid"]])
+def test_rank_host_requires_an_explicit_valid_logging_mode(options):
+    # Argument refusal must happen before the host reads its launch pipe.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "tokenspeed_engine.host",
+            "--control-fd",
+            "0",
+            "--process-title",
+            "test-rank-host",
+            *options,
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 2, result.stderr
+    assert "--enable-async-logging" in result.stderr
+
+
 def test_bootstrap_preserves_gpu_spacing(monkeypatch):
     args = ServerArgs(
         model="unavailable",
@@ -109,7 +138,9 @@ def test_bootstrap_preserves_gpu_spacing(monkeypatch):
     )
     host = HostBootstrap.__new__(HostBootstrap)
     with pytest.raises(FileNotFoundError, match="model weights unavailable"):
-        host.__init__(args, None, None, None, None, None)
+        host.__init__(
+            args, None, None, None, None, None, replica_memory_transitions=False
+        )
     assert host._gpu_id == 3
 
 
@@ -300,6 +331,81 @@ def test_spawned_host_inherits_start_context_environment(tmp_path, monkeypatch):
     finally:
         proc.terminate()
         proc.join(timeout=10)
+
+
+@pytest.mark.parametrize(
+    "inherited_preload, configured_preload, expected_preload",
+    [
+        pytest.param(*case[1:], id=case[0])
+        for prepend in (False, True)
+        for case in preload_cases(prepend_hook=prepend)
+    ],
+)
+def test_spawned_host_inherits_environment_from_start_context(
+    tmp_path, monkeypatch, inherited_preload, configured_preload, expected_preload
+):
+    if inherited_preload is None:
+        monkeypatch.delenv("LD_PRELOAD", raising=False)
+    else:
+        monkeypatch.setenv("LD_PRELOAD", inherited_preload)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/original")
+
+    @contextmanager
+    def start_context():
+        with monkeypatch.context() as launch_env:
+            launch_env.setenv("LD_PRELOAD", configured_preload)
+            launch_env.setenv("LD_LIBRARY_PATH", "/test/runtime:/original")
+            yield
+
+    binary = _fake_host(
+        tmp_path,
+        """
+        import os
+        connection.recv_bytes()
+        connection.send({
+            "status": "ready",
+            "preload": os.environ.get("LD_PRELOAD"),
+            "library_path": os.environ.get("LD_LIBRARY_PATH"),
+        })
+        time.sleep(600)
+        """,
+    )
+    proc, reader = start_rust_host(binary, *_rank_args(0), start_context(), None, False)
+    try:
+        (ready,) = receive_ready_messages([reader], [proc])
+        assert re.split(r"[:\s]+", ready["preload"]) == expected_preload.split(":")
+        assert ready["library_path"] == "/test/runtime:/original"
+        assert os.environ.get("LD_PRELOAD") == inherited_preload
+        assert os.environ["LD_LIBRARY_PATH"] == "/original"
+    finally:
+        reader.close()
+        proc.terminate()
+        proc.join(timeout=10)
+
+
+@pytest.mark.parametrize(
+    "inherited_preload, configured_preload",
+    [pytest.param(*case[1:], id=case[0]) for case in conflicting_preload_cases()],
+)
+def test_conflicting_memory_saver_hooks_are_refused_before_spawn(
+    monkeypatch, inherited_preload, configured_preload
+):
+    if inherited_preload is None:
+        monkeypatch.delenv("LD_PRELOAD", raising=False)
+    else:
+        monkeypatch.setenv("LD_PRELOAD", inherited_preload)
+
+    @contextmanager
+    def start_context():
+        with monkeypatch.context() as launch_env:
+            launch_env.setenv("LD_PRELOAD", configured_preload)
+            yield
+
+    with pytest.raises(ValueError, match="multiple memory-saver preload hooks"):
+        start_rust_host(
+            "unused-test-host", *_rank_args(0), start_context(), None, False
+        )
+    assert os.environ.get("LD_PRELOAD") == inherited_preload
 
 
 def test_a_host_that_dies_before_ready_fails_the_launch(tmp_path):
@@ -570,6 +676,7 @@ def _data_plane(handle: DeviceHandle) -> HostDataPlane:
         max_encoder_tokens=None,
         attn_tp_cpu_group=None,
         epd_publisher=None,
+        replica_memory_transitions=False,
         starting=False,
     )
 
