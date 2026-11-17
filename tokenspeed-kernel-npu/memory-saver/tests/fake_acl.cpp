@@ -17,12 +17,10 @@ std::map<void *, Physical *> physicals;
 std::map<void *, size_t> hosts;
 std::map<std::string, size_t> counts;
 std::map<std::string, unsigned> failures;
-std::vector<std::string> operations;
 int current_device = 0;
 aclrtContext current_context = nullptr;
 bool enter(const char *name) {
   ++counts[name];
-  operations.emplace_back(name);
   auto it = failures.find(name);
   if (it != failures.end() && it->second) { --it->second; return false; }
   return true;
@@ -48,18 +46,15 @@ namespace fake_acl {
 void reset() {
   if (!reservations.empty() || !physicals.empty() || !hosts.empty())
     throw std::runtime_error("fake reset attempted with live resources");
-  counts.clear(); failures.clear(); operations.clear(); current_device = 0; current_context = nullptr;
+  counts.clear(); failures.clear(); current_device = 0; current_context = nullptr;
 }
 void fail_next(const std::string &api) { ++failures[api]; }
-void clear_failures() { failures.clear(); }
 void set_device(int device) { current_device = device; }
 void set_context(aclrtContext context) { current_context = context; }
 size_t live_reservations() { return reservations.size(); }
 size_t live_physical() { return physicals.size(); }
 size_t live_host() { return hosts.size(); }
 size_t calls(const std::string &api) { return counts[api]; }
-std::vector<std::string> trace() { return operations; }
-size_t granularity() { return page; }
 } // namespace fake_acl
 
 extern "C" {

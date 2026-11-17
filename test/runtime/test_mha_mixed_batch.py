@@ -86,23 +86,26 @@ def _backend(
     return mha.MHAAttnBackend(config, spec, kernel_page_size=page_size)
 
 
-def _full_history_router(leaf, *, is_draft=False):
+def _router(leaves, *, windows):
     router = CacheGroupRouter(
         None,
-        is_draft=is_draft,
-        spec_num_tokens=leaf.spec_num_tokens,
+        is_draft=False,
+        spec_num_tokens=next(iter(leaves.values())).spec_num_tokens,
         device="cpu",
         consumed_group_ids=None,
     )
     router.bind(
         CacheGroupGeometry(
-            granularities={"full_attention": 16},
-            attn_kinds={"full_attention": "full_history"},
+            granularities=dict.fromkeys(leaves, 16),
+            attn_kinds={
+                gid: "full_history" if window is None else "sliding"
+                for gid, window in windows.items()
+            },
             full_history_group_id="full_attention",
-            row_geometry={"full_attention": (16, 1)},
-            windows={"full_attention": None},
+            row_geometry=dict.fromkeys(leaves, (16, 1)),
+            windows=windows,
         ),
-        {"full_attention": leaf},
+        leaves,
     )
     return router
 
@@ -111,7 +114,9 @@ def _full_history_router(leaf, *, is_draft=False):
 def test_ascend_fia_update_reads_target_verify_metadata_for_partial_batch(width):
     leaf = _backend(width=width)
     runner = ForwardStepRunner.__new__(ForwardStepRunner)
-    runner.attn_backend = _full_history_router(leaf)
+    runner.attn_backend = _router(
+        {"full_attention": leaf}, windows={"full_attention": None}
+    )
     runner.attn_backend.init_cuda_graph_state(4, max_extend_tokens=0)
     runner.draft_attn_backend = None
     runner.max_tokens_per_req = width
@@ -273,26 +278,7 @@ def test_router_refreshes_both_real_leaves_and_padded_writes_across_mixed_rounds
     leaves = {
         gid: _backend(width=width, page_size=size) for gid, size in groups.items()
     }
-    router = CacheGroupRouter(
-        None,
-        is_draft=False,
-        spec_num_tokens=width,
-        device="cpu",
-        consumed_group_ids=None,
-    )
-    router.bind(
-        CacheGroupGeometry(
-            granularities={gid: 16 for gid in groups},
-            attn_kinds={
-                "full_attention": "full_history",
-                "sliding_attention": "sliding",
-            },
-            full_history_group_id="full_attention",
-            row_geometry={gid: (16, 1) for gid in groups},
-            windows={"full_attention": None, "sliding_attention": 512},
-        ),
-        leaves,
-    )
+    router = _router(leaves, windows={"full_attention": None, "sliding_attention": 512})
     bucket = 64
     router.init_cuda_graph_state(4, max_extend_tokens=bucket)
     layers = {}

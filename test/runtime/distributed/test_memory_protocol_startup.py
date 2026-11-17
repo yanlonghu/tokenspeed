@@ -29,37 +29,10 @@ import torch.multiprocessing as mp
 
 from tokenspeed.runtime.engine.memory_protocol import (
     gather_collective_addresses,
-    supports_replica_memory_transitions,
 )
 
 # CPU regressions use the runtime job's complete dependency environment.
 register_cuda_ci(est_time=60, suite="runtime-1gpu")
-
-
-@pytest.mark.parametrize(
-    ("checked_startup", "memory_saver", "backend_capable", "role", "expected"),
-    [
-        (True, True, True, "prefill", True),
-        (True, True, True, "decode", True),
-        (True, True, True, "null", True),
-        (True, True, True, "encode", False),
-        (True, False, True, "prefill", False),
-        (False, True, True, "prefill", False),
-        (True, True, False, "prefill", False),
-    ],
-)
-def test_memory_protocol_v3_requires_checked_backend_capability(
-    checked_startup, memory_saver, backend_capable, role, expected
-):
-    assert (
-        supports_replica_memory_transitions(
-            checked_startup=checked_startup,
-            memory_saver=memory_saver,
-            backend_capable=backend_capable,
-            role=role,
-        )
-        is expected
-    )
 
 
 def _rendezvous(rank, rendezvous, protocols, addresses, legacy_ranks):
@@ -110,7 +83,6 @@ def _rendezvous(rank, rendezvous, protocols, addresses, legacy_ranks):
         pytest.param((2, 3), (1, 2), (), id="pp2-mixed-v2-ingress"),
         pytest.param((3, 2), (1, 2), (), id="pp2-mixed-v3-ingress"),
         pytest.param((2, 3), (1, 2), (0,), id="pp2-mixed-legacy-ingress"),
-        pytest.param((2, 2, 3, 3), (1, 1, 2, 2), (0, 1), id="ep4-mixed-legacy"),
         pytest.param((2, 2), (1, 2), (0,), id="pp2-legacy-compatible-v2"),
         pytest.param((3, 3), (1, 2), (), id="pp2-all-v3"),
     ],

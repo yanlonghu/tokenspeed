@@ -1583,18 +1583,19 @@ def test_ascend_saver_refuses_to_launch_with_unavailable_pools(operation):
         AscendMemorySaverDeviceHandle,
     )
     from tokenspeed.runtime.execution.weight_memory import WeightMemoryState
+    from tokenspeed.runtime.utils.ascend_memory_saver_state import PoolState
 
     executor = _SleepExecutor([])
-    executor.model_runner = SimpleNamespace(
-        memory_saver_adapter=SimpleNamespace(
-            assert_active=mock.Mock(side_effect=RuntimeError("pool unavailable"))
-        )
+    pools = PoolState(
+        backend=mock.Mock(), make_pool=mock.Mock(), synchronize=lambda: None
     )
+    pools.pause("kv_cache")
+    executor.model_runner = SimpleNamespace(memory_saver_adapter=pools)
     handle = AscendMemorySaverDeviceHandle(
         executor, weight_memory=WeightMemoryState(policy="cpu_backup", models=[])
     )
 
-    with pytest.raises(RuntimeError, match="pool unavailable"):
+    with pytest.raises(RuntimeError, match="Memory is unavailable"):
         if operation == "plan_without_forward":
             handle.execute(None, None, cache_ops=())
         else:

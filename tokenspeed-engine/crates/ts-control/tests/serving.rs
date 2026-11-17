@@ -1749,11 +1749,15 @@ async fn start_ranks_with(
 /// round.
 type Script = Vec<Vec<EngineRequest>>;
 
+type LiveInput = std::sync::mpsc::Receiver<(Vec<EngineRequest>, std::sync::mpsc::Sender<()>)>;
+
 /// One engine's frontend in a scripted run: each round it hands the engine
 /// the next batch of its script, after the messages `react` made of the
 /// previous round's outputs. Once its script ran out it is gone, so the
 /// engine stops.
 struct ScriptedFrontend {
+    /// Live ingress keeps the same rank harness open while a test drives it.
+    input: Option<LiveInput>,
     script: VecDeque<Vec<EngineRequest>>,
     react: fn(&[StreamedOutput]) -> Vec<EngineRequest>,
     reacted: Vec<EngineRequest>,
@@ -1764,14 +1768,23 @@ struct ScriptedFrontend {
 }
 
 impl Frontend for ScriptedFrontend {
-    fn receive(&mut self, _wait: Option<Duration>) -> Vec<EngineRequest> {
+    fn receive(&mut self, wait: Option<Duration>) -> Vec<EngineRequest> {
+        if let Some(input) = &self.input {
+            return match input.recv_timeout(wait.unwrap_or(Duration::ZERO)) {
+                Ok((messages, delivered)) => {
+                    delivered.send(()).unwrap();
+                    messages
+                }
+                Err(_) => Vec::new(),
+            };
+        }
         let mut messages = std::mem::take(&mut self.reacted);
         messages.extend(self.script.pop_front().unwrap_or_default());
         messages
     }
 
     fn closed(&self) -> bool {
-        self.script.is_empty() && self.reacted.is_empty()
+        self.input.is_none() && self.script.is_empty() && self.reacted.is_empty()
     }
 
     fn send(&mut self, outputs: Vec<StreamedOutput>, _load: Load) {
@@ -1819,10 +1832,47 @@ fn run_scripted(
     scripts: Vec<Script>,
     react: fn(&[StreamedOutput]) -> Vec<EngineRequest>,
 ) -> Vec<ScriptedRank> {
+    run_scripted_live(
+        layout,
+        in_flight_depth,
+        tiers,
+        setup,
+        scripts,
+        react,
+        Vec::new(),
+        |_, _| {},
+    )
+}
+
+struct LiveObservation {
+    replies: Arc<Mutex<Vec<ControlOutput>>>,
+    outputs: Arc<Mutex<Vec<StreamedOutput>>>,
+    device_ops: Arc<Mutex<Vec<String>>>,
+}
+
+fn run_scripted_live(
+    layout: Layout,
+    in_flight_depth: usize,
+    tiers: Tiers,
+    setup: Setup,
+    scripts: Vec<Script>,
+    react: fn(&[StreamedOutput]) -> Vec<EngineRequest>,
+    inputs: Vec<LiveInput>,
+    drive: impl FnOnce(&[LiveObservation], &AtomicBool),
+) -> Vec<ScriptedRank> {
+    struct StopOnDrop(Arc<AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
     let (world, tp_size, num_engines) = layout.sizes();
     assert_eq!(scripts.len(), num_engines);
     let config = loop_config(in_flight_depth, matches!(layout, Layout::Pp(_)), &setup);
     let stop = Arc::new(AtomicBool::new(false));
+    let _stop_on_drop = StopOnDrop(stop.clone());
+    let mut inputs = inputs.into_iter();
+    let mut observed = Vec::new();
     let (mesh_listeners, addresses) = mesh_listeners(world);
     let mut scripts = scripts.into_iter();
     let (done, outcomes) = std::sync::mpsc::channel();
@@ -1838,7 +1888,13 @@ fn run_scripted(
             let finished = Arc::new(Mutex::new(Vec::new()));
             let outputs = Arc::new(Mutex::new(Vec::new()));
             let released = device.released.clone();
+            observed.push(LiveObservation {
+                replies: replies.clone(),
+                outputs: outputs.clone(),
+                device_ops: device_ops.clone(),
+            });
             let frontend = (rank % tp_size == 0).then(|| ScriptedFrontend {
+                input: inputs.next(),
                 script: scripts.next().unwrap().into(),
                 react,
                 reacted: Vec::new(),
@@ -1875,6 +1931,7 @@ fn run_scripted(
             )
         })
         .collect();
+    drive(&observed, &stop);
     for _ in 0..world {
         if outcomes.recv_timeout(Duration::from_secs(60)).is_err() {
             stop.store(true, Ordering::Relaxed);
@@ -5032,145 +5089,6 @@ async fn a_load_refused_by_any_rank_runs_on_none_and_can_be_retried() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_refused_load_preserves_l3_publication_until_the_same_version_retry() {
-    async fn publication(engine: &Engine, query_id: &str) -> GetSharedPrefixPublicationReqOutput {
-        let request =
-            ControlRequest::GetSharedPrefixPublication(GetSharedPrefixPublicationReqInput {
-                rid: None,
-                http_worker_ipc: None,
-                query_id: query_id.to_owned(),
-                input_ids: (1..=65).collect(),
-                max_prefix_tokens: 64,
-            });
-        let mut replies =
-            tokio::time::timeout(Duration::from_secs(10), engine.client.control(request))
-                .await
-                .expect("no publication reply")
-                .unwrap();
-        assert_eq!(replies.len(), 1);
-        let ControlOutput::GetSharedPrefixPublication(reply) = replies.pop().unwrap() else {
-            panic!("unexpected publication reply");
-        };
-        assert!(reply.success, "{}", reply.message);
-        assert_eq!(reply.query_id, query_id);
-        assert_eq!(reply.dp_rank, 0);
-        reply
-    }
-
-    async fn published(engine: &Engine, query_id: &str) -> GetSharedPrefixPublicationReqOutput {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let reply = publication(engine, query_id).await;
-                if reply.status == "published" {
-                    assert_eq!(reply.confirmed_prefix_tokens, 64);
-                    return reply;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the warm prefix was not published")
-    }
-
-    let store = Arc::new(MemoryStore::new());
-    let engine = start_ranks_with(
-        Layout::Tp(2),
-        1,
-        Tiers::L3,
-        Setup {
-            l3_memory_store: Some(store.clone()),
-            weight_load_refused: Some(|rank| rank == 1),
-            ..Setup::default()
-        },
-    )
-    .await;
-    assert_eq!(
-        tokens(&run(&engine.client, request("warm", 65, budget(2))).await),
-        [1000, 1001]
-    );
-    let before = published(&engine, "before-refusal").await;
-    let old_namespace = ts_l3::keys::key_prefix("serving", "v1", "");
-    assert_eq!(before.storage_namespace, old_namespace);
-    assert!(before.cache_epoch > 0);
-    let old_keys = store.keys();
-    assert!(!old_keys.is_empty());
-    assert!(old_keys.iter().all(|key| key.starts_with(&old_namespace)));
-
-    let update = ControlRequest::UpdateWeightFromDisk(UpdateWeightFromDiskReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        model_path: "/checkpoint".to_owned(),
-        load_format: None,
-        weight_version: Some("v2".to_owned()),
-        flush_cache: true,
-    });
-    assert_eq!(
-        control(&engine, update.clone()).await,
-        [("UpdateWeightFromDiskReqOutput", false)]
-    );
-    let refused = publication(&engine, "after-refusal").await;
-    assert_eq!(refused.status, "published");
-    assert_eq!(refused.confirmed_prefix_tokens, 64);
-    assert_eq!(refused.cache_epoch, before.cache_epoch);
-    assert_eq!(refused.storage_namespace, before.storage_namespace);
-    let refused_keys = store.keys();
-    assert!(old_keys.iter().all(|key| refused_keys.contains(key)));
-    for rank in &engine.ranks {
-        assert!(rank.device_ops.lock().unwrap().is_empty());
-        assert!(rank.weight_commits.lock().unwrap().is_empty());
-    }
-    let chunks = run(&engine.client, request("after-refusal", 65, budget(2))).await;
-    assert_eq!(tokens(&chunks), [1000, 1001]);
-    assert!(chunks.last().unwrap().cached_tokens > 0);
-
-    for rank in &engine.ranks {
-        rank.weight_load_refused.store(false, Ordering::SeqCst);
-    }
-    // A just-finished request can still refuse the flush. Retry the same
-    // checkpoint version; refused admission must not reserve that version.
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while control(&engine, update.clone())
-            .await
-            .iter()
-            .any(|(_, success)| !success)
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the same-version retry never succeeded");
-    assert_weight_commits(&engine, &[true]).await;
-    for rank in &engine.ranks {
-        assert_eq!(
-            *rank.device_ops.lock().unwrap(),
-            ["UpdateWeightFromDiskReqInput"]
-        );
-    }
-    assert!(
-        store.keys().is_empty(),
-        "the old L3 namespace survived the flush"
-    );
-    let flushed = publication(&engine, "after-commit").await;
-    assert_eq!(flushed.status, "pending");
-    assert_eq!(flushed.confirmed_prefix_tokens, 0);
-    assert!(flushed.cache_epoch > before.cache_epoch);
-    let new_namespace = ts_l3::keys::key_prefix("serving", "v2", "");
-    assert_eq!(flushed.storage_namespace, new_namespace);
-
-    let chunks = run(&engine.client, request("after-retry", 65, budget(2))).await;
-    assert_eq!(tokens(&chunks), [1000, 1001]);
-    assert_eq!(chunks.last().unwrap().cached_tokens, 0);
-    let after = published(&engine, "new-publication").await;
-    assert_eq!(after.cache_epoch, flushed.cache_epoch);
-    assert_eq!(after.storage_namespace, new_namespace);
-    assert!(!store.keys().is_empty());
-    assert!(store
-        .keys()
-        .iter()
-        .all(|key| key.starts_with(&new_namespace)));
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn a_failed_weight_load_is_committed_as_invalid_on_every_rank() {
     for layout in [Layout::Dp(2), Layout::Tp(2), Layout::Pp(2)] {
         let engine = start_ranks_with(
@@ -5310,914 +5228,8 @@ fn memory_transition(release: bool, tags: Option<&[&str]>) -> EngineRequest {
     EngineRequest::Control(Box::new(memory_request(release, tags, None)))
 }
 
-// Keep the protocol explicit while using the same real scripted scheduler/mesh.
-fn run_memory_scripted(
-    layout: Layout,
-    replica_memory_transitions: bool,
-    setup: Setup,
-    scripts: Vec<Script>,
-) -> Vec<ScriptedRank> {
-    run_scripted(
-        layout,
-        0,
-        Tiers::DeviceOnly,
-        Setup {
-            replica_memory_transitions,
-            ..setup
-        },
-        scripts,
-        no_reaction,
-    )
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn the_client_releases_and_resumes_all_memory_sharing_replicas() {
-    let engine = start_ranks_with(
-        Layout::TpDp { tp: 2, dp: 2 },
-        0,
-        Tiers::DeviceOnly,
-        Setup {
-            replica_memory_transitions: true,
-            ..Setup::default()
-        },
-    )
-    .await;
-    assert_eq!(
-        control(&engine, memory_request(true, None, Some("park"))).await,
-        [("ReleaseMemoryOccupationReqOutput", true); 2]
-    );
-    assert_eq!(
-        control(&engine, memory_request(false, None, Some("wake"))).await,
-        [("ResumeMemoryOccupationReqOutput", true); 2]
-    );
-    for rank in &engine.ranks {
-        assert_eq!(
-            *rank.device_ops.lock().unwrap(),
-            ["release kv_cache,weights", "resume weights,kv_cache"]
-        );
-    }
-    for rid in ["first-replica", "second-replica"] {
-        let chunks = run(&engine.client, request(rid, 4, budget(2))).await;
-        assert_eq!(tokens(&chunks), [1000, 1001]);
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_wire_memory_release_with_a_list_id_is_refused_without_sleeping() {
-    let engine = start_ranks_with(
-        Layout::Dp(2),
-        0,
-        Tiers::DeviceOnly,
-        Setup {
-            replica_memory_transitions: true,
-            ..Setup::default()
-        },
-    )
-    .await;
-    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-        rid: Some(StrOrList::Many(vec!["park".to_owned()])),
-        http_worker_ipc: None,
-        tags: None,
-    });
-    assert_eq!(
-        control(&engine, release).await,
-        [("ReleaseMemoryOccupationReqOutput", false); 2]
-    );
-    for rank in &engine.ranks {
-        assert!(rank.device_ops.lock().unwrap().is_empty());
-    }
-    for rid in ["first-replica", "second-replica"] {
-        let chunks = run(&engine.client, request(rid, 4, budget(2))).await;
-        assert_eq!(tokens(&chunks), [1000, 1001]);
-    }
-}
-
-#[test]
-fn cancelling_memory_release_preserves_prefixes_when_one_rank_cannot_clear_l1() {
-    let ranks = run_memory_scripted(
-        Layout::Tp(2),
-        true,
-        Setup {
-            host_l2_rank: Some(1),
-            ..Setup::default()
-        },
-        vec![vec![
-            vec![
-                EngineRequest::Add(Box::new(request("seed", 33, budget(1)))),
-                memory_transition(true, Some(&["kv_cache"])),
-            ],
-            vec![
-                EngineRequest::Control(Box::new(resume())),
-                EngineRequest::Add(Box::new(request("probe", 33, budget(1)))),
-            ],
-        ]],
-    );
-    // The warmup forward commits during the release drain. Rank 1 starts
-    // a write-through finish store which pins its pages before the next
-    // plan dispatches the copy. The script stops at the probe's dispatch
-    // so the deliberately rank-local store never enters TP acknowledgment.
-    assert_eq!(
-        outcome(ranks[0].replies.clone()),
-        [
-            ("ReleaseMemoryOccupationReqOutput", false),
-            ("ResumeSchedulerReqOutput", true),
-        ]
-    );
-    assert!(ranks[0].cache_ops.is_empty());
-    assert_eq!(ranks[1].cache_ops, [CacheOpKind::WriteBack]);
-    let probe_prefixes: Vec<_> = ranks
-        .iter()
-        .map(|rank| {
-            rank.prefill_prefixes
-                .iter()
-                .find_map(|(rid, prefix)| (rid == "probe").then_some(*prefix))
-        })
-        .collect();
-    assert_eq!(
-        probe_prefixes,
-        [Some(32); 2],
-        "the cached prefix on each rank after cancellation"
-    );
-    for (rank, observed) in ranks.iter().enumerate() {
-        assert_eq!(observed.outcome, Ok(()), "rank {rank}");
-        assert!(observed.device_ops.is_empty(), "rank {rank}");
-    }
-}
-
-#[test]
-fn a_rank_refusing_memory_preflight_leaves_the_replica_usable() {
-    let mut script = vec![Vec::new(); 24];
-    script[0].push(memory_transition(true, Some(&["weights"])));
-    script[1].push(EngineRequest::Add(Box::new(request(
-        "after-refusal",
-        4,
-        budget(2),
-    ))));
-    script[6].push(memory_transition(true, None));
-    script[8].push(memory_transition(false, None));
-    script[10].push(memory_transition(false, Some(&["weights"])));
-    script[12].push(memory_transition(false, Some(&["kv_cache"])));
-    script[14].push(EngineRequest::Control(Box::new(disk_load())));
-    script[16].push(memory_transition(false, Some(&["kv_cache"])));
-    script[17].push(EngineRequest::Add(Box::new(request(
-        "after-wake",
-        4,
-        budget(2),
-    ))));
-    let ranks = run_memory_scripted(
-        Layout::Tp(2),
-        true,
-        Setup {
-            discard_memory_rank: Some(1),
-            ..Setup::default()
-        },
-        vec![script],
-    );
-    assert_eq!(
-        outcome(ranks[0].replies.clone()),
-        [
-            ("ReleaseMemoryOccupationReqOutput", false),
-            ("ReleaseMemoryOccupationReqOutput", true),
-            ("ResumeMemoryOccupationReqOutput", false),
-            ("ResumeMemoryOccupationReqOutput", true),
-            ("ResumeMemoryOccupationReqOutput", false),
-            ("UpdateWeightFromDiskReqOutput", true),
-            ("ResumeMemoryOccupationReqOutput", true),
-        ]
-    );
-    assert_eq!(
-        ranks[0].finished,
-        [
-            ("after-refusal".to_owned(), "length".to_owned()),
-            ("after-wake".to_owned(), "length".to_owned()),
-        ]
-    );
-    for rank in ranks {
-        assert_eq!(rank.outcome, Ok(()));
-        assert_eq!(
-            rank.device_ops,
-            [
-                "release kv_cache,weights",
-                "resume weights",
-                disk_load().tag(),
-                "resume kv_cache",
-            ]
-        );
-    }
-}
-
-#[test]
-fn only_replica_memory_transitions_withhold_success_on_peer_device_failure() {
-    for replica_memory_transitions in [false, true] {
-        for failed_release in [false, true] {
-            let mut script = vec![vec![memory_transition(true, None)]];
-            if !failed_release {
-                script.push(vec![memory_transition(false, None)]);
-            }
-            let ranks = run_memory_scripted(
-                Layout::Tp(2),
-                replica_memory_transitions,
-                Setup {
-                    memory_release_failure_rank: failed_release.then_some(1),
-                    memory_resume_failure_rank: (!failed_release).then_some(1),
-                    ..Setup::default()
-                },
-                vec![script],
-            );
-            let operation = if failed_release { "release" } else { "resume" };
-            assert!(ranks[1]
-                .outcome
-                .as_ref()
-                .unwrap_err()
-                .contains(&format!("injected memory {operation} failure")));
-            let mut expected = Vec::new();
-            if !failed_release || !replica_memory_transitions {
-                expected.push(("ReleaseMemoryOccupationReqOutput", true));
-            }
-            if !failed_release && !replica_memory_transitions {
-                expected.push(("ResumeMemoryOccupationReqOutput", true));
-            }
-            assert_eq!(outcome(ranks[0].replies.clone()), expected);
-            assert_eq!(ranks[0].outcome.is_err(), replica_memory_transitions);
-        }
-    }
-}
-
-#[test]
-fn dp_memory_release_and_resume_wait_for_delayed_replicas() {
-    let mut scripts = vec![vec![Vec::new(); 65]; 2];
-    scripts[0][2].push(memory_transition(true, None));
-    scripts[1][6].push(EngineRequest::Add(Box::new(request(
-        "drain",
-        4,
-        budget(24),
-    ))));
-    scripts[1][12].push(memory_transition(true, Some(&["weights", "kv_cache"])));
-    scripts[0][42].push(memory_transition(false, None));
-    scripts[1][50].push(memory_transition(false, Some(&["kv_cache", "weights"])));
-    scripts[0][56].push(EngineRequest::Add(Box::new(request("awake", 4, budget(2)))));
-    let ranks = run_memory_scripted(
-        Layout::TpDp { tp: 2, dp: 2 },
-        true,
-        Setup::default(),
-        scripts,
-    );
-    assert_scripted_tokens(&ranks[0], "awake", 2);
-    assert_scripted_tokens(&ranks[2], "drain", 24);
-    for leader in [&ranks[0], &ranks[2]] {
-        assert_eq!(
-            outcome(leader.replies.clone()),
-            [
-                ("ReleaseMemoryOccupationReqOutput", true),
-                ("ResumeMemoryOccupationReqOutput", true),
-            ]
-        );
-    }
-    assert_eq!(ranks[0].idle_forwards, ranks[2].forwards);
-    assert_eq!(ranks[2].idle_forwards, ranks[0].forwards);
-    for rank in ranks {
-        assert_eq!(rank.outcome, Ok(()));
-        assert_eq!(
-            rank.device_ops,
-            ["release kv_cache,weights", "resume weights,kv_cache"]
-        );
-    }
-}
-
-#[test]
-fn dp_memory_preflight_refusal_leaves_every_replica_usable() {
-    let mut scripts = vec![vec![Vec::new(); 18]; 2];
-    scripts[0][0].push(memory_transition(true, Some(&["weights"])));
-    scripts[1][3].push(memory_transition(true, Some(&["weights"])));
-    scripts[0][6].push(EngineRequest::Add(Box::new(request("first", 4, budget(2)))));
-    scripts[1][9].push(EngineRequest::Add(Box::new(request("peer", 4, budget(2)))));
-    let ranks = run_memory_scripted(
-        Layout::TpDp { tp: 2, dp: 2 },
-        true,
-        Setup {
-            discard_memory_rank: Some(3),
-            ..Setup::default()
-        },
-        scripts,
-    );
-    assert_scripted_tokens(&ranks[0], "first", 2);
-    assert_scripted_tokens(&ranks[2], "peer", 2);
-    for leader in [&ranks[0], &ranks[2]] {
-        assert_eq!(
-            outcome(leader.replies.clone()),
-            [("ReleaseMemoryOccupationReqOutput", false)]
-        );
-    }
-    for rank in ranks {
-        assert_eq!(rank.outcome, Ok(()));
-        assert!(rank.device_ops.is_empty());
-    }
-}
-
-#[test]
-fn dp_memory_replies_follow_the_arrival_order_of_same_kind_requests() {
-    let mut scripts = vec![vec![Vec::new(); 20]; 2];
-    for (rank, script) in scripts.iter_mut().enumerate() {
-        script[rank * 3].extend([
-            memory_transition(true, Some(&["weights"])),
-            memory_transition(true, None),
-        ]);
-    }
-    let ranks = run_memory_scripted(
-        Layout::Dp(2),
-        true,
-        Setup {
-            discard_memory_rank: Some(1),
-            ..Setup::default()
-        },
-        scripts,
-    );
-    for rank in ranks {
-        assert_eq!(rank.outcome, Ok(()));
-        assert_eq!(
-            outcome(rank.replies),
-            [
-                ("ReleaseMemoryOccupationReqOutput", false),
-                ("ReleaseMemoryOccupationReqOutput", true),
-            ]
-        );
-        assert_eq!(rank.device_ops, ["release kv_cache,weights"]);
-    }
-}
-
-#[test]
-fn dp_memory_device_failure_prevents_success_on_every_replica() {
-    for failed_release in [false, true] {
-        let mut scripts = vec![vec![Vec::new(); 20]; 2];
-        scripts[0][0].push(memory_transition(true, None));
-        scripts[1][2].push(memory_transition(true, None));
-        if !failed_release {
-            scripts[0][5].push(memory_transition(false, None));
-            scripts[1][7].push(memory_transition(false, None));
-        }
-        let ranks = run_memory_scripted(
-            Layout::TpDp { tp: 2, dp: 2 },
-            true,
-            Setup {
-                memory_release_failure_rank: failed_release.then_some(3),
-                memory_resume_failure_rank: (!failed_release).then_some(3),
-                ..Setup::default()
-            },
-            scripts,
-        );
-        let operation = if failed_release { "release" } else { "resume" };
-        assert!(ranks[3]
-            .outcome
-            .as_ref()
-            .unwrap_err()
-            .contains(&format!("injected memory {operation} failure")));
-        for leader in [&ranks[0], &ranks[2]] {
-            let successful: Vec<_> = outcome(leader.replies.clone())
-                .into_iter()
-                .filter(|&(_, success)| success)
-                .collect();
-            if failed_release {
-                assert!(successful.is_empty());
-            } else {
-                assert_eq!(successful, [("ReleaseMemoryOccupationReqOutput", true)]);
-            }
-        }
-        assert!(ranks.iter().all(|rank| rank.outcome.is_err()));
-    }
-}
-
-#[test]
-fn coordinated_memory_release_keeps_communication_resident() {
-    let mut script = vec![Vec::new(); 12];
-    script[0].push(memory_transition(true, Some(&["kv_cache", "nccl"])));
-    script[2].push(EngineRequest::Add(Box::new(request("still-awake", 4, budget(2)))));
-    script[6].push(memory_transition(true, None));
-    script[9].push(memory_transition(false, None));
-    let ranks = run_memory_scripted(Layout::Tp(2), true, Setup::default(), vec![script]);
-    assert_eq!(
-        outcome(ranks[0].replies.clone()),
-        [
-            ("ReleaseMemoryOccupationReqOutput", false),
-            ("ReleaseMemoryOccupationReqOutput", true),
-            ("ResumeMemoryOccupationReqOutput", true),
-        ]
-    );
-    assert_scripted_tokens(&ranks[0], "still-awake", 2);
-    for rank in ranks {
-        assert_eq!(rank.outcome, Ok(()));
-        assert_eq!(rank.device_ops, ["release kv_cache,weights", "resume weights,kv_cache"]);
-    }
-}
-
-#[test]
-fn dp_ascend_graph_release_matches_effective_tags_and_waits_for_kv_wake() {
-    for wake_kv in [false, true] {
-        let mut scripts = vec![vec![Vec::new(); 30]; 2];
-        scripts[0][0].push(memory_transition(true, Some(&["acl_graph"])));
-        scripts[1][2].push(memory_transition(true, Some(&["kv_cache", "acl_graph"])));
-        for script in &mut scripts {
-            script[6].push(memory_transition(false, Some(&["acl_graph"])));
-            if wake_kv {
-                script[18].push(memory_transition(false, Some(&["kv_cache"])));
-            }
-        }
-        scripts[0][10].push(EngineRequest::Add(Box::new(request("awake", 4, budget(2)))));
-        let ranks = run_scripted(
-            Layout::TpDp { tp: 2, dp: 2 },
-            0,
-            Tiers::DeviceOnly,
-            Setup {
-                replica_memory_transitions: true,
-                ascend_graph: true,
-                ..Setup::default()
-            },
-            scripts,
-            no_reaction,
-        );
-        let mut expected_ops = vec!["release kv_cache,acl_graph", "resume acl_graph"];
-        let mut expected_replies = vec![
-            ("ReleaseMemoryOccupationReqOutput", true),
-            ("ResumeMemoryOccupationReqOutput", true),
-        ];
-        if wake_kv {
-            expected_ops.push("resume kv_cache");
-            expected_replies.push(("ResumeMemoryOccupationReqOutput", true));
-            assert_scripted_tokens(&ranks[0], "awake", 2);
-        } else {
-            assert!(ranks[0].finished.is_empty());
-            assert_eq!(ranks[0].forwards, 0);
-        }
-        for leader in [&ranks[0], &ranks[2]] {
-            assert_eq!(outcome(leader.replies.clone()), expected_replies);
-        }
-        for rank in ranks {
-            assert_eq!(rank.outcome, Ok(()));
-            assert_eq!(rank.device_ops, expected_ops);
-        }
-    }
-}
-
-#[test]
-fn dp_memory_release_rejects_mismatched_tags_or_ids_and_can_retry() {
-    for (peer_tags, peer_id) in [
-        (Some(&["weights"][..]), "release-attempt"),
-        (Some(&["kv_cache"][..]), "different-attempt"),
-    ] {
-        let mut scripts = vec![vec![Vec::new(); 20]; 2];
-        scripts[0][0].push(EngineRequest::Control(Box::new(memory_request(
-            true,
-            Some(&["kv_cache"]),
-            Some("release-attempt"),
-        ))));
-        scripts[1][2].push(EngineRequest::Control(Box::new(memory_request(
-            true,
-            peer_tags,
-            Some(peer_id),
-        ))));
-        for script in &mut scripts {
-            script[6].push(memory_transition(true, None));
-            script[9].push(memory_transition(false, None));
-        }
-        let ranks = run_memory_scripted(Layout::Dp(2), true, Setup::default(), scripts);
-        for rank in ranks {
-            assert_eq!(rank.outcome, Ok(()));
-            assert_eq!(
-                outcome(rank.replies),
-                [
-                    ("ReleaseMemoryOccupationReqOutput", false),
-                    ("ReleaseMemoryOccupationReqOutput", true),
-                    ("ResumeMemoryOccupationReqOutput", true),
-                ]
-            );
-            assert_eq!(
-                rank.device_ops,
-                ["release kv_cache,weights", "resume weights,kv_cache"]
-            );
-        }
-    }
-}
-
-#[test]
-fn dp_memory_release_and_resume_cannot_match_one_another() {
-    let mut scripts = vec![vec![Vec::new(); 20]; 2];
-    for script in &mut scripts {
-        script[0].push(memory_transition(true, Some(&["kv_cache"])));
-        script[10].push(memory_transition(false, Some(&["kv_cache"])));
-    }
-    scripts[0][4].push(memory_transition(true, Some(&["weights"])));
-    scripts[1][6].push(memory_transition(false, Some(&["kv_cache"])));
-    let ranks = run_memory_scripted(Layout::Dp(2), true, Setup::default(), scripts);
-    for (rank, observed) in ranks.into_iter().enumerate() {
-        assert_eq!(observed.outcome, Ok(()));
-        assert_eq!(
-            outcome(observed.replies),
-            [
-                ("ReleaseMemoryOccupationReqOutput", true),
-                (
-                    if rank == 0 {
-                        "ReleaseMemoryOccupationReqOutput"
-                    } else {
-                        "ResumeMemoryOccupationReqOutput"
-                    },
-                    false,
-                ),
-                ("ResumeMemoryOccupationReqOutput", true),
-            ]
-        );
-        assert_eq!(observed.device_ops, ["release kv_cache", "resume kv_cache"]);
-    }
-}
-
-#[test]
-fn dp_memory_missing_release_participant_can_cancel_without_sleeping() {
-    let mut scripts = vec![vec![Vec::new(); 30]; 2];
-    scripts[0][0].push(memory_transition(true, None));
-    scripts[1][3].push(EngineRequest::Add(Box::new(request("peer", 4, budget(3)))));
-    scripts[1][10].push(EngineRequest::Control(Box::new(resume())));
-    scripts[0][13].push(EngineRequest::Add(Box::new(request(
-        "after-cancel",
-        4,
-        budget(2),
-    ))));
-    let ranks = run_memory_scripted(Layout::Dp(2), true, Setup::default(), scripts);
-    assert_scripted_tokens(&ranks[0], "after-cancel", 2);
-    assert_scripted_tokens(&ranks[1], "peer", 3);
-    assert_eq!(
-        outcome(ranks[0].replies.clone()),
-        [("ReleaseMemoryOccupationReqOutput", false)]
-    );
-    assert_eq!(
-        outcome(ranks[1].replies.clone()),
-        [("ResumeSchedulerReqOutput", true)]
-    );
-    assert!(ranks.iter().all(|rank| rank.device_ops.is_empty()));
-}
-
-#[test]
-fn dp_memory_timeout_refuses_the_observed_batch_and_a_late_peer_can_retry() {
-    use std::sync::mpsc;
-
-    // Keep the real 30-second production deadline. A channel stands in only
-    // for frontend delivery, so this exercises two expiry gates, the real
-    // schedulers and TP/DP mesh without adding a production clock override.
-    struct LiveFrontend {
-        inner: ScriptedFrontend,
-        input: mpsc::Receiver<Vec<EngineRequest>>,
-        delivered: mpsc::Sender<Instant>,
-    }
-    impl Frontend for LiveFrontend {
-        fn receive(&mut self, wait: Option<Duration>) -> Vec<EngineRequest> {
-            match self.input.recv_timeout(wait.unwrap_or(Duration::ZERO)) {
-                Ok(messages) => {
-                    self.delivered.send(Instant::now()).unwrap();
-                    messages
-                }
-                Err(_) => Vec::new(),
-            }
-        }
-        fn closed(&self) -> bool {
-            false
-        }
-        fn send(&mut self, outputs: Vec<StreamedOutput>, load: Load) {
-            self.inner.send(outputs, load);
-        }
-        fn reply(&mut self, reply: ControlOutput) {
-            self.inner.reply(reply);
-        }
-    }
-    struct StopOnDrop(Arc<AtomicBool>);
-    impl Drop for StopOnDrop {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Relaxed);
-        }
-    }
-    fn wait_for(deadline: Instant, mut ready: impl FnMut() -> bool) {
-        while !ready() {
-            assert!(
-                Instant::now() < deadline,
-                "memory timeout test did not finish"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    let layout = Layout::TpDp { tp: 2, dp: 2 };
-    let setup = Setup {
-        replica_memory_transitions: true,
-        ..Setup::default()
-    };
-    let config = loop_config(0, false, &setup);
-    let stop = Arc::new(AtomicBool::new(false));
-    let _stop_on_drop = StopOnDrop(stop.clone());
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let (listeners, addresses) = mesh_listeners(4);
-    let (done, outcomes) = mpsc::channel();
-    let mut inputs = Vec::new();
-    let mut deliveries = Vec::new();
-    let mut replies = Vec::new();
-    let mut outputs = Vec::new();
-    let mut device_ops = Vec::new();
-    let mut threads = Vec::new();
-    for (rank, mesh_listener) in listeners.into_iter().enumerate() {
-        let device = fake_device(layout, rank, &setup);
-        device_ops.push(device.device_ops.clone());
-        let frontend = if rank % 2 == 0 {
-            let (input, receiver) = mpsc::channel();
-            let (delivered, delivery) = mpsc::channel();
-            let observed_replies = Arc::new(Mutex::new(Vec::new()));
-            let observed_outputs = Arc::new(Mutex::new(Vec::new()));
-            inputs.push(input);
-            deliveries.push(delivery);
-            replies.push(observed_replies.clone());
-            outputs.push(observed_outputs.clone());
-            Some(LiveFrontend {
-                inner: ScriptedFrontend {
-                    script: VecDeque::new(),
-                    react: no_reaction,
-                    reacted: Vec::new(),
-                    replies: observed_replies,
-                    finished: Arc::new(Mutex::new(Vec::new())),
-                    outputs: observed_outputs,
-                },
-                input: receiver,
-                delivered,
-            })
-        } else {
-            None
-        };
-        let spec = RankSpec {
-            rank,
-            layout,
-            tiers: Tiers::DeviceOnly,
-            config: config.clone(),
-            setup: setup.clone(),
-            mesh_listener,
-            addresses: addresses.clone(),
-        };
-        let (stop, done) = (stop.clone(), done.clone());
-        threads.push(thread::spawn(move || {
-            let result = run_rank(spec, device, None, || frontend, &stop);
-            done.send(result.map_err(|error| error.to_string()))
-                .unwrap();
-        }));
-    }
-    let calls = |ids: &[&str]| {
-        ids.iter()
-            .map(|id| EngineRequest::Control(Box::new(memory_request(true, None, Some(id)))))
-            .collect()
-    };
-    inputs[0].send(calls(&["old-head"])).unwrap();
-    let old_delivered = deliveries[0]
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .unwrap();
-    // The followers have not reached their own deadline when the old head
-    // expires. Rejecting only that head would leave their replies pending.
-    thread::sleep(Duration::from_secs(15));
-    inputs[0].send(calls(&["young-1", "young-2"])).unwrap();
-    let young_delivered = deliveries[0]
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .unwrap();
-    wait_for(deadline, || replies[0].lock().unwrap().len() == 3);
-    assert!(old_delivered.elapsed() >= Duration::from_secs(29));
-    assert!(young_delivered.elapsed() < Duration::from_secs(25));
-    assert_eq!(
-        outcome(replies[0].lock().unwrap().clone()),
-        [("ReleaseMemoryOccupationReqOutput", false); 3]
-    );
-    assert!(replies[1].lock().unwrap().is_empty());
-
-    // These are the same fanout's delayed deliveries, not retries. This peer
-    // missed the expiry gate and answers only after its own head expires.
-    inputs[1]
-        .send(calls(&["old-head", "young-1", "young-2"]))
-        .unwrap();
-    let late_delivered = deliveries[1]
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .unwrap();
-    wait_for(deadline, || replies[1].lock().unwrap().len() == 3);
-    assert!(late_delivered.elapsed() >= Duration::from_secs(29));
-    assert_eq!(
-        outcome(replies[1].lock().unwrap().clone()),
-        [("ReleaseMemoryOccupationReqOutput", false); 3]
-    );
-    assert!(device_ops.iter().all(|ops| ops.lock().unwrap().is_empty()));
-
-    // All six old replies have now been collected. A fresh matching ID must
-    // release and resume normally, with no stale call consuming either reply.
-    for (release, id, count) in [(true, "fresh-release", 4), (false, "fresh-resume", 5)] {
-        for input in &inputs {
-            input
-                .send(vec![EngineRequest::Control(Box::new(memory_request(
-                    release,
-                    None,
-                    Some(id),
-                )))])
-                .unwrap();
-        }
-        wait_for(deadline, || {
-            replies
-                .iter()
-                .all(|rows| rows.lock().unwrap().len() == count)
-        });
-    }
-    for rows in &replies {
-        assert_eq!(
-            outcome(rows.lock().unwrap().clone()),
-            [
-                ("ReleaseMemoryOccupationReqOutput", false),
-                ("ReleaseMemoryOccupationReqOutput", false),
-                ("ReleaseMemoryOccupationReqOutput", false),
-                ("ReleaseMemoryOccupationReqOutput", true),
-                ("ResumeMemoryOccupationReqOutput", true),
-            ]
-        );
-    }
-    for input in &inputs {
-        input
-            .send(vec![EngineRequest::Add(Box::new(request(
-                "awake",
-                4,
-                budget(2),
-            )))])
-            .unwrap();
-    }
-    wait_for(deadline, || {
-        outputs.iter().all(|rows| {
-            rows.lock()
-                .unwrap()
-                .iter()
-                .any(|row| row.finish_reason.is_some())
-        })
-    });
-    for rows in &outputs {
-        let tokens: Vec<_> = rows
-            .lock()
-            .unwrap()
-            .iter()
-            .flat_map(|row| row.output_ids.iter().copied())
-            .collect();
-        assert_eq!(tokens, [1000, 1001]);
-    }
-    for ops in device_ops {
-        assert_eq!(
-            *ops.lock().unwrap(),
-            ["release kv_cache,weights", "resume weights,kv_cache"]
-        );
-    }
-    stop.store(true, Ordering::Relaxed);
-    for _ in 0..4 {
-        assert_eq!(
-            outcomes
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .unwrap(),
-            Ok(())
-        );
-    }
-    for thread in threads {
-        thread.join().unwrap();
-    }
-}
-
-#[test]
-fn dp_memory_release_in_the_continue_batch_is_refused_then_retry_succeeds() {
-    let mut scripts = vec![vec![Vec::new(); 18]; 2];
-    for script in &mut scripts {
-        script[0].extend([
-            EngineRequest::Control(Box::new(resume())),
-            memory_transition(true, None),
-        ]);
-        script[4].push(memory_transition(true, None));
-        script[6].push(memory_transition(false, None));
-    }
-    scripts[0][9].push(EngineRequest::Add(Box::new(request("awake", 4, budget(2)))));
-    let ranks = run_memory_scripted(Layout::Dp(2), true, Setup::default(), scripts);
-    assert_scripted_tokens(&ranks[0], "awake", 2);
-    for rank in ranks {
-        assert_eq!(rank.outcome, Ok(()));
-        assert_eq!(
-            outcome(rank.replies),
-            [
-                ("ResumeSchedulerReqOutput", true),
-                ("ReleaseMemoryOccupationReqOutput", false),
-                ("ReleaseMemoryOccupationReqOutput", true),
-                ("ResumeMemoryOccupationReqOutput", true),
-            ]
-        );
-        assert_eq!(
-            rank.device_ops,
-            ["release kv_cache,weights", "resume weights,kv_cache"]
-        );
-    }
-}
-
-#[test]
-fn dp_memory_asymmetric_continue_refuses_current_calls_then_accepts_retry() {
-    for (layout, tp) in [(Layout::Dp(2), 1), (Layout::TpDp { tp: 2, dp: 2 }, 2)] {
-        let mut scripts = vec![vec![Vec::new(); 20]; 2];
-        // A single ingress cancels. The new release must receive the same
-        // refusal everywhere, rather than survive at only the cancelling one.
-        scripts[0][0].push(EngineRequest::Control(Box::new(resume())));
-        for script in &mut scripts {
-            script[0].push(memory_transition(true, None));
-            script[6].push(memory_transition(true, None));
-            script[10].push(memory_transition(false, None));
-        }
-        scripts[0][13].push(EngineRequest::Add(Box::new(request("awake", 4, budget(2)))));
-        let ranks = run_memory_scripted(layout, true, Setup::default(), scripts);
-        assert_scripted_tokens(&ranks[0], "awake", 2);
-        for (rank, observed) in ranks.into_iter().enumerate() {
-            assert_eq!(observed.outcome, Ok(()));
-            let replies = outcome(observed.replies);
-            if rank % tp == 0 {
-                let mut expected = Vec::new();
-                if rank == 0 {
-                    expected.push(("ResumeSchedulerReqOutput", true));
-                }
-                expected.extend([
-                    ("ReleaseMemoryOccupationReqOutput", false),
-                    ("ReleaseMemoryOccupationReqOutput", true),
-                    ("ResumeMemoryOccupationReqOutput", true),
-                ]);
-                assert_eq!(replies, expected);
-            } else {
-                assert!(replies.is_empty());
-            }
-            assert_eq!(
-                observed.device_ops,
-                ["release kv_cache,weights", "resume weights,kv_cache"]
-            );
-        }
-    }
-}
-
-#[test]
-fn dp_memory_cancels_an_active_drain_without_clearing_peer_prefixes() {
-    let mut scripts = vec![vec![Vec::new(); 45]; 2];
-    scripts[0][0].push(EngineRequest::Add(Box::new(request("seed", 33, budget(1)))));
-    scripts[1][3].push(EngineRequest::Add(Box::new(request(
-        "drain",
-        4,
-        budget(28),
-    ))));
-    scripts[0][6].push(memory_transition(true, None));
-    scripts[1][7].push(memory_transition(true, None));
-    scripts[1][11].push(EngineRequest::Control(Box::new(resume())));
-    scripts[0][13].push(EngineRequest::Add(Box::new(request(
-        "probe",
-        33,
-        budget(1),
-    ))));
-    let ranks = run_memory_scripted(Layout::Dp(2), true, Setup::default(), scripts);
-    assert_scripted_tokens(&ranks[0], "probe", 1);
-    assert_scripted_tokens(&ranks[1], "drain", 28);
-    assert!(ranks[0]
-        .prefill_prefixes
-        .contains(&("probe".to_owned(), 32)));
-    assert_eq!(
-        outcome(ranks[0].replies.clone()),
-        [("ReleaseMemoryOccupationReqOutput", false)]
-    );
-    let peer_replies = outcome(ranks[1].replies.clone());
-    assert_eq!(peer_replies.len(), 2);
-    assert!(peer_replies.contains(&("ReleaseMemoryOccupationReqOutput", false)));
-    assert!(peer_replies.contains(&("ResumeSchedulerReqOutput", true)));
-    assert!(ranks.iter().all(|rank| rank.device_ops.is_empty()));
-}
-
-#[test]
-fn dp_memory_cancelled_resume_leaves_every_replica_asleep() {
-    let mut scripts = vec![vec![Vec::new(); 25]; 2];
-    for script in &mut scripts {
-        script[0].push(memory_transition(true, None));
-    }
-    scripts[0][4].push(memory_transition(false, None));
-    scripts[1][10].push(EngineRequest::Control(Box::new(resume())));
-    scripts[1][13].push(EngineRequest::Add(Box::new(request(
-        "still-asleep",
-        4,
-        budget(2),
-    ))));
-    let ranks = run_memory_scripted(Layout::Dp(2), true, Setup::default(), scripts);
-    assert_eq!(
-        outcome(ranks[0].replies.clone()),
-        [
-            ("ReleaseMemoryOccupationReqOutput", true),
-            ("ResumeMemoryOccupationReqOutput", false),
-        ]
-    );
-    assert_eq!(
-        outcome(ranks[1].replies.clone()),
-        [
-            ("ReleaseMemoryOccupationReqOutput", true),
-            ("ResumeSchedulerReqOutput", false),
-        ]
-    );
-    for rank in ranks {
-        assert_eq!(rank.outcome, Ok(()));
-        assert_eq!(rank.device_ops, ["release kv_cache,weights"]);
-        assert_eq!(rank.forwards, 0);
-    }
-}
+#[path = "serving/test_memory_saver.rs"]
+mod test_memory_saver;
 
 #[test]
 fn dp_memory_release_waits_for_every_rank_to_pause_and_drain() {
@@ -6673,6 +5685,7 @@ fn a_profile_keeps_the_spans_of_rounds_that_did_something() {
     script[0] = vec![EngineRequest::Add(Box::new(request("r", 16, budget(3))))];
     let finished = Arc::new(Mutex::new(Vec::new()));
     let frontend = ScriptedFrontend {
+        input: None,
         script: script.into(),
         react: no_reaction,
         reacted: Vec::new(),

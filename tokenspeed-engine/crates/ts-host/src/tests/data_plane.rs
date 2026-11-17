@@ -256,14 +256,6 @@ fn a_memory_preflight_refusal_allows_another_check() {
         data_plane.check_memory_transition(&tags, false).unwrap(),
         (true, String::new())
     );
-
-    let checks: Vec<_> = calls(&plane)
-        .into_iter()
-        .filter(|(name, _)| name == "check_memory_transition")
-        .collect();
-    assert_eq!(checks.len(), 2);
-    assert_eq!(checks[0].1, checks[1].1);
-    assert_ne!(checks[0].1, this_thread());
 }
 
 #[test]

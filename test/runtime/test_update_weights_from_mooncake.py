@@ -171,6 +171,7 @@ class _FakeSdk(ModuleType):
         self.updater_configs: list = []
         self.updates: list = []
         self.fail_with: Exception | None = None
+        self.result: object | None = None
 
         class EngineType:
             members = {"FLUENT_LLM": "fluent-llm"}
@@ -203,7 +204,7 @@ class _FakeSdk(ModuleType):
                     model.load_weights([("a", torch.ones(1))])
                     model.load_weights([("b", torch.ones(1))])
                 sdk.updates.append((models, version))
-                return {"version": version}
+                return {"version": version} if sdk.result is None else sdk.result
 
         def make_model_updater(config, *, weight_store):
             sdk.updater_configs.append((config, weight_store))
@@ -495,7 +496,7 @@ class _TinyDiscardModel(BaseCausalLM):
             self.total.copy_(self.a + self.b)
 
 
-def _discard_device(monkeypatch):
+def _discard_device(monkeypatch, *, backend):
     # Only transport/device operations are replaced. The handle, runner,
     # updater adapter, session, model and validity state are the real classes.
     monkeypatch.setattr(torch.cuda, "empty_cache", mock.Mock())
@@ -504,6 +505,9 @@ def _discard_device(monkeypatch):
     state = WeightMemoryState(policy="discard", models=[model])
     runner = _runner(_model_update_args(enable_memory_saver=True))
     runner.model = model
+    runner.device = backend
+    if backend == "npu":
+        monkeypatch.setattr(torch, "get_device_module", lambda _: torch.cuda)
     executor = _executor(draft_policy="retain", with_draft=False)
     executor.model_runner = runner
     return DeviceHandle(executor, weight_memory=state), state, model
@@ -543,8 +547,14 @@ def test_ascend_saver_requires_cache_flush_before_weight_update(policy, request_
     assert state.kv_released
 
 
-def test_discarded_device_waits_for_global_commit_before_kv_wake(sdk, monkeypatch):
-    handle, state, model = _discard_device(monkeypatch)
+@pytest.mark.parametrize(
+    "backend,result", [("cuda", None), ("cuda", False), ("npu", False)]
+)
+def test_discarded_device_waits_for_global_commit_before_kv_wake(
+    sdk, monkeypatch, backend, result
+):
+    sdk.result = result
+    handle, state, model = _discard_device(monkeypatch, backend=backend)
     address = model.a.data_ptr()
     _lose_weight_pages(state, model)
     state.resume(lambda: None)
@@ -565,41 +575,8 @@ def test_discarded_device_waits_for_global_commit_before_kv_wake(sdk, monkeypatc
     handle.before_kv_resume()
     state.require_usable()
     assert sdk.updates[0][1] == 11
-
-
-@pytest.mark.parametrize("backend", ["cuda", "npu"])
-def test_sdk_false_obeys_the_backend_commit_contract(sdk, monkeypatch, backend):
-    class Updater:
-        def update_weights(self, models, *, version):
-            for model in models:
-                model.load_weights([("a", torch.ones(1)), ("b", torch.ones(1))])
-            return False
-
-    monkeypatch.setattr(
-        sdk, "make_model_updater", lambda config, *, weight_store: Updater()
-    )
-    handle, state, model = _discard_device(monkeypatch)
-    handle._executor.model_runner.device = backend
-    if backend == "npu":
-        # CPU tensors exercise the complete stream; emulate only the device API.
-        monkeypatch.setattr(
-            runner_module,
-            "torch",
-            SimpleNamespace(
-                device=lambda *_: torch.device("cpu"),
-                get_device_module=lambda _: SimpleNamespace(
-                    synchronize=lambda _: None, empty_cache=lambda: None
-                ),
-            ),
-        )
-    _lose_weight_pages(state, model)
-    state.resume(lambda: None)
-    ok, message = handle.update_weights(_mooncake_req(11))
-    assert ok, message
-    handle.commit_weight_update(True)
-    assert message == "applied model version 11: False"
-    handle.before_kv_resume()
-    assert model.total.item() == 2
+    if result is False:
+        assert message == "applied model version 11: False"
 
 
 @pytest.mark.parametrize("fail_load", [False, True])
@@ -623,7 +600,7 @@ def test_snapshot_update_obeys_the_discard_commit_boundary(sdk, monkeypatch, fai
     monkeypatch.setattr(
         sdk, "make_model_updater", lambda config, *, weight_store: SnapshotUpdater()
     )
-    handle, state, model = _discard_device(monkeypatch)
+    handle, state, model = _discard_device(monkeypatch, backend="cuda")
     address = model.a.data_ptr()
     _lose_weight_pages(state, model)
     state.resume(lambda: None)
@@ -651,7 +628,7 @@ def test_snapshot_update_obeys_the_discard_commit_boundary(sdk, monkeypatch, fai
 def test_discarded_device_poisoned_by_local_or_remote_update_failure(
     sdk, monkeypatch, remote_failure
 ):
-    handle, state, model = _discard_device(monkeypatch)
+    handle, state, model = _discard_device(monkeypatch, backend="cuda")
     _lose_weight_pages(state, model)
     state.resume(lambda: None)
     if not remote_failure:
@@ -675,7 +652,7 @@ def test_discarded_device_poisoned_by_local_or_remote_update_failure(
 def test_discarded_device_rejects_update_before_kv_release_or_weight_remap(
     sdk, monkeypatch, unmapped
 ):
-    handle, state, model = _discard_device(monkeypatch)
+    handle, state, model = _discard_device(monkeypatch, backend="cuda")
     if unmapped:
         _lose_weight_pages(state, model)
     # The control plane's admission check refuses without touching anything.
@@ -707,7 +684,7 @@ def test_discarded_device_rejects_update_before_kv_release_or_weight_remap(
 
 
 def test_discarded_device_refuses_partial_non_sdk_updates(sdk, monkeypatch):
-    handle, state, model = _discard_device(monkeypatch)
+    handle, state, model = _discard_device(monkeypatch, backend="cuda")
     _lose_weight_pages(state, model)
     state.resume(lambda: None)
     success, message = handle.update_weights(
@@ -867,89 +844,80 @@ def _bootstrap_args(*, device: str, memory_saver: bool, role: str) -> ServerArgs
 
 @pytest.mark.parametrize("checked_startup", [False, True])
 @pytest.mark.parametrize(
-    "device,memory_saver,protocol,required,coordinated",
+    "device,role,memory_saver,protocol,required",
     [
-        ("cuda", True, None, 2, False),
-        ("cuda", True, 1, 2, False),
-        ("cuda", True, 2, None, False),
-        ("cuda", True, 3, None, False),
-        ("npu", True, None, 3, False),
-        ("npu", True, 1, 3, False),
-        ("npu", True, 2, 3, False),
-        ("npu", True, 3, None, True),
-        ("npu", False, None, None, False),
+        ("cuda", "null", True, None, 2),
+        ("cuda", "null", True, 1, 2),
+        ("cuda", "null", True, 2, None),
+        ("cuda", "prefill", True, 3, None),
+        ("npu", "null", True, None, 3),
+        ("npu", "null", True, 1, 3),
+        ("npu", "null", True, 2, 3),
+        ("npu", "null", True, 3, None),
+        ("npu", "prefill", True, 3, None),
+        ("npu", "decode", True, 3, None),
+        ("npu", "null", False, None, None),
+        ("npu", "encode", False, 2, None),
+        ("npu", "encode", True, 2, None),
     ],
 )
-def test_host_bootstrap_checks_the_actual_binary_protocol_before_device_build(
-    monkeypatch, checked_startup, device, memory_saver, protocol, required, coordinated
+def test_host_protocol_and_capability_agree_before_device_build(
+    monkeypatch, checked_startup, device, role, memory_saver, protocol, required
 ):
     from tokenspeed.runtime.engine import rust_host
+    from tokenspeed.runtime.engine.memory_protocol import (
+        supports_replica_memory_transitions,
+    )
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
 
+    expected = checked_startup and memory_saver and device == "npu" and role != "encode"
+    assert (
+        supports_replica_memory_transitions(
+            checked_startup=checked_startup,
+            memory_saver=memory_saver,
+            backend_capable=device == "npu",
+            role=role,
+        )
+        is expected
+    )
+    assert TorchMemorySaverAdapter.adapter_class(
+        memory_saver, device=device
+    ).supports_replica_memory_transitions is (device == "npu" and memory_saver)
     built = object()
     build = mock.Mock(return_value=built)
-    monkeypatch.setattr(rust_host, "HostBootstrap", build)
+    monkeypatch.setattr(
+        rust_host, "EncodeBootstrap" if role == "encode" else "HostBootstrap", build
+    )
     receiver, sender = Pipe(duplex=True)
     with receiver, sender:
-        args = _bootstrap_args(device=device, memory_saver=memory_saver, role="null")
-        sender.send((args, None, None))
-        call_args = (os.dup(receiver.fileno()), None)
-        if protocol is not None:
-            call_args += (protocol,)
-        if checked_startup:
-            _, start = rust_host.prepare_bootstrap(
-                call_args[0], validate_memory_protocol=True
+        sender.send(
+            (
+                _bootstrap_args(device=device, memory_saver=memory_saver, role=role),
+                None,
+                None,
             )
+        )
+        fd = os.dup(receiver.fileno())
+        if checked_startup:
+            capability, start = rust_host.prepare_bootstrap(
+                fd, validate_memory_protocol=True
+            )
+            assert capability is expected
+            build.assert_not_called()
             invoke = lambda: start(None, protocol if protocol is not None else 0, None)
         else:
-            invoke = lambda: rust_host.bootstrap(*call_args)
+            arguments = (fd, None) if protocol is None else (fd, None, protocol)
+            invoke = lambda: rust_host.bootstrap(*arguments)
         if required is not None:
             with pytest.raises(RuntimeError, match=f"protocol {required}"):
                 invoke()
             build.assert_not_called()
         else:
             assert invoke() is built
-            build.assert_called_once()
-            assert build.call_args.kwargs["replica_memory_transitions"] is (
-                coordinated and checked_startup
-            )
-
-
-@pytest.mark.parametrize("checked_startup", [False, True])
-@pytest.mark.parametrize(
-    "device,role,memory_saver,replica_memory_transitions",
-    [
-        ("cuda", "null", True, False),
-        ("cuda", "prefill", True, False),
-        ("npu", "null", True, True),
-        ("npu", "null", False, False),
-        ("npu", "encode", False, False),
-    ],
-)
-def test_prepare_bootstrap_selects_replica_memory_transitions_before_device_build(
-    monkeypatch, checked_startup, device, role, memory_saver, replica_memory_transitions
-):
-    from tokenspeed.runtime.engine import rust_host
-
-    built = object()
-    build = mock.Mock(return_value=built)
-    constructor = "EncodeBootstrap" if role == "encode" else "HostBootstrap"
-    monkeypatch.setattr(rust_host, constructor, build)
-    receiver, sender = Pipe(duplex=True)
-    with receiver, sender:
-        args = _bootstrap_args(device=device, memory_saver=memory_saver, role=role)
-        sender.send((args, None, None))
-        capability, start = rust_host.prepare_bootstrap(
-            os.dup(receiver.fileno()), validate_memory_protocol=checked_startup
-        )
-        assert capability is (replica_memory_transitions and checked_startup)
-        build.assert_not_called()
-        if device == "npu" and memory_saver and role != "encode" and not capability:
-            with pytest.raises(RuntimeError, match="requires ts-host protocol 3"):
-                start(None, 2, None)
-            build.assert_not_called()
-        else:
-            assert start(None, 3 if capability else 2, None) is built
-            build.assert_called_once()
+            if role != "encode":
+                assert build.call_args.kwargs["replica_memory_transitions"] is expected
 
 
 @pytest.fixture(autouse=True)

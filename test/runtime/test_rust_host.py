@@ -194,9 +194,10 @@ def _rank_args(rank: int) -> tuple[ServerArgs, PortArgs]:
     return server_args, PortArgs.init_new(server_args)
 
 
+@pytest.mark.parametrize("device", ["cuda", "npu"])
 @pytest.mark.parametrize("enable_async_logging", [False, True])
 def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(
-    tmp_path, enable_async_logging
+    tmp_path, enable_async_logging, device
 ):
     binary = _fake_host(
         tmp_path,
@@ -204,11 +205,20 @@ def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(
         server_args, port_args, relay = connection.recv()
         connection.send({"status": "ready", "rank": server_args.mapping.rank,
                          "python": python, "relay": relay,
-                         "async_logging": args["--enable-async-logging"]})
+                         "async_logging": args["--enable-async-logging"],
+                         "restore_gil": args.get("--restore-gil-for-exit")})
         time.sleep(600)
         """,
     )
-    server_args, port_args = _rank_args(3)
+    server_args = ServerArgs(
+        model="x",
+        device=device,
+        disable_prefill_graph=device == "npu",
+        disable_pdl=device == "npu",
+        enable_memory_saver=False,
+    )
+    server_args.mapping.rank = 3
+    port_args = PortArgs.init_new(server_args)
     server_args.enable_async_logging = enable_async_logging
     proc, reader = start_rust_host(
         binary, server_args, port_args, nullcontext(), "ipc:///tmp/relay", False
@@ -221,6 +231,7 @@ def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(
             "python": sys.executable,
             "relay": "ipc:///tmp/relay",
             "async_logging": str(enable_async_logging).lower(),
+            "restore_gil": "true" if device == "npu" else None,
         }
         assert proc.is_alive() and proc.exitcode is None
     finally:
@@ -300,48 +311,6 @@ def test_spawned_host_inherits_start_context_environment(tmp_path, monkeypatch):
         assert ready["context"] == "configured"
         assert key not in os.environ
     finally:
-        proc.terminate()
-        proc.join(timeout=10)
-
-
-@pytest.mark.parametrize("device", ["cuda", "npu"])
-def test_only_the_npu_launcher_requests_gil_restoration(tmp_path, device):
-    binary = _fake_host(
-        tmp_path,
-        """
-        connection.recv()
-        connection.send({"status": "ready", "args": sys.argv[1:]})
-        time.sleep(600)
-        """,
-    )
-    server_args = ServerArgs(
-        model="x",
-        device=device,
-        disable_prefill_graph=device == "npu",
-        disable_pdl=device == "npu",
-    )
-    server_args.mapping.rank = 0
-    port_args = PortArgs.init_new(server_args)
-    proc, reader = start_rust_host(
-        binary, server_args, port_args, nullcontext(), None, False
-    )
-    try:
-        (ready,) = receive_ready_messages([reader], [proc])
-        args = ready["args"]
-        expected = [
-            "--python",
-            sys.executable,
-            "--control-fd",
-            args[3],
-            "--enable-async-logging",
-            str(server_args.enable_async_logging).lower(),
-        ]
-        assert int(args[3]) >= 0
-        if device == "npu":
-            expected.extend(["--restore-gil-for-exit", "true"])
-        assert args == expected
-    finally:
-        reader.close()
         proc.terminate()
         proc.join(timeout=10)
 

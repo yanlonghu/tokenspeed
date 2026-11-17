@@ -28,38 +28,48 @@ void expect_pattern(void *ptr, size_t size, unsigned char value) {
   for (size_t i = 0; i < size; ++i) REQUIRE(bytes[i] == value);
 }
 
-void backup_roundtrip() {
-  reset();
-  REQUIRE(saver_abi_version() == 2);
-  constexpr size_t n = 7000;
-  void *ptr = weights_malloc(n, 0, nullptr);
-  REQUIRE(ptr != nullptr);
-  REQUIRE(stat_has("\"aligned_bytes\":8192"));
-  pattern(ptr, n, 0x6b);
-  for (int i = 0; i < 5; ++i) {
-    ok(saver_pause("weights"));
-    REQUIRE(fake_acl::live_reservations() == 1);
-    REQUIRE(fake_acl::live_physical() == 0);
-    REQUIRE(fake_acl::live_host() == 1);
-    REQUIRE(stat_has("\"paused_segments\":1"));
-    REQUIRE(stat_has("\"physical_bytes\":0"));
-    ok(saver_pause("weights"));
-    ok(saver_resume("weights"));
-    expect_pattern(ptr, n, 0x6b); // Same original pointer, no re-reservation.
-    REQUIRE(fake_acl::live_host() == 0);
-    ok(saver_resume("weights"));
+void policy_roundtrips() {
+  struct Policy {
+    const char *tag;
+    void *(*allocate)(size_t, int, aclrtStream);
+    bool backup;
+  };
+  for (const auto &policy : {
+           Policy{"weights", weights_backup_malloc, true},
+           Policy{"acl_graph", graph_backup_malloc, true},
+           Policy{"acl_graph", graph_discard_malloc, false}}) {
+    reset();
+    REQUIRE(saver_abi_version() == 2);
+    constexpr size_t n = 7000;
+    void *ptr = policy.allocate(n, 0, nullptr); REQUIRE(ptr);
+    REQUIRE(stat_has("\"aligned_bytes\":8192"));
+    for (int i = 0; i < 5; ++i) {
+      pattern(ptr, n, 0x6b);
+      const auto copies = fake_acl::calls("aclrtMemcpy");
+      ok(saver_pause(policy.tag));
+      REQUIRE(fake_acl::live_reservations() == 1);
+      REQUIRE(fake_acl::live_physical() == 0);
+      REQUIRE(fake_acl::live_host() == size_t(policy.backup));
+      REQUIRE(stat_has("\"paused_segments\":1"));
+      REQUIRE(stat_has("\"physical_bytes\":0"));
+      ok(saver_pause(policy.tag));
+      ok(saver_resume(policy.tag));
+      // A fresh fake page is poisoned; discard cannot pass via old page reuse.
+      expect_pattern(ptr, n, policy.backup ? 0x6b : 0xcd);
+      REQUIRE(fake_acl::live_host() == 0);
+      if (!policy.backup) REQUIRE(fake_acl::calls("aclrtMemcpy") == copies);
+      ok(saver_resume(policy.tag));
+    }
+    REQUIRE(fake_acl::calls("aclrtReserveMemAddress") == 1);
+    ok(saver_release(ptr));
   }
-  REQUIRE(fake_acl::calls("aclrtReserveMemAddress") == 1);
-  REQUIRE(fake_acl::calls("aclrtMapMem") == 6);
-  REQUIRE(fake_acl::calls("aclrtSynchronizeDevice") == 10);
-  ok(saver_release(ptr));
 }
 
 void default_policies_tags_and_paused_free() {
   reset();
-  void *w = weights_malloc(100, 0, nullptr);
+  void *w = weights_backup_malloc(100, 0, nullptr);
   void *k = kv_malloc(100, 0, nullptr);
-  void *g = graph_malloc(100, 0, nullptr);
+  void *g = graph_backup_malloc(100, 0, nullptr);
   REQUIRE(w && k && g);
   pattern(w, 100, 0x11); pattern(g, 100, 0x22);
   REQUIRE(stat_has("\"tag\":\"acl_graph\""));
@@ -112,7 +122,7 @@ void resume_failure_matrix() {
     REQUIRE(fake_acl::live_host() == 1);
     REQUIRE(stat_has("\"backup_valid\":true"));
     REQUIRE(stat_has("\"active_segments\":0"));
-    REQUIRE(weights_malloc(1, 0, nullptr) == nullptr);
+    REQUIRE(weights_backup_malloc(1, 0, nullptr) == nullptr);
     ok(saver_resume("weights"));
     expect_pattern(p, 77, 0xa7);
     REQUIRE(fake_acl::live_host() == 0);
@@ -123,7 +133,7 @@ void resume_failure_matrix() {
 
 void abort_failed_pause_and_repause_failed_resume() {
   reset();
-  void *p = weights_malloc(19, 0, nullptr); REQUIRE(p); pattern(p, 19, 0x49);
+  void *p = weights_backup_malloc(19, 0, nullptr); REQUIRE(p); pattern(p, 19, 0x49);
   fake_acl::fail_next("aclrtMemcpy");
   REQUIRE(saver_pause("weights") != 0);
   ok(saver_resume("weights")); // Failed backup left original physical data valid.
@@ -141,11 +151,11 @@ void allocation_failure_cleanup() {
   for (const char *api : {"aclrtGetDevice", "aclrtGetCurrentContext", "aclrtMemGetAllocationGranularity", "aclrtReserveMemAddress",
                           "aclrtMallocPhysical", "aclrtMapMem"}) {
     reset(); fake_acl::fail_next(api);
-    REQUIRE(weights_malloc(42, 0, nullptr) == nullptr);
+    REQUIRE(weights_backup_malloc(42, 0, nullptr) == nullptr);
     REQUIRE(std::strlen(saver_last_error()) != 0);
     REQUIRE(fake_acl::live_reservations() == 0 && fake_acl::live_physical() == 0);
     REQUIRE(saver_has_callback_fault() == 0);
-    void *retry = weights_malloc(42, 0, nullptr); REQUIRE(retry);
+    void *retry = weights_backup_malloc(42, 0, nullptr); REQUIRE(retry);
     ok(saver_release(retry));
   }
 }
@@ -155,7 +165,7 @@ void allocation_rollback_fault_is_terminal() {
   void *kv = kv_malloc(42, 0, nullptr); REQUIRE(kv);
   fake_acl::fail_next("aclrtMapMem");
   fake_acl::fail_next("aclrtFreePhysical");
-  REQUIRE(weights_malloc(42, 0, nullptr) == nullptr);
+  REQUIRE(weights_backup_malloc(42, 0, nullptr) == nullptr);
   const std::string error = saver_last_error();
   REQUIRE(error.find("aclrtMapMem failed") != std::string::npos);
   REQUIRE(error.find("allocation rollback failed: aclrtFreePhysical failed") != std::string::npos);
@@ -163,7 +173,7 @@ void allocation_rollback_fault_is_terminal() {
   REQUIRE(stat_has("\"releasing_segments\":1"));
   REQUIRE(fake_acl::live_reservations() == 2 && fake_acl::live_physical() == 2);
   const auto reserves = fake_acl::calls("aclrtReserveMemAddress");
-  REQUIRE(weights_malloc(42, 0, nullptr) == nullptr);
+  REQUIRE(weights_backup_malloc(42, 0, nullptr) == nullptr);
   REQUIRE(fake_acl::calls("aclrtReserveMemAddress") == reserves);
   REQUIRE(saver_pause("kv_cache") != 0);
   REQUIRE(saver_resume("kv_cache") != 0);
@@ -187,7 +197,7 @@ void free_failure_matrix() {
       REQUIRE(fake_acl::calls("aclrtUnmapMem") == 0);
     ok(saver_collect_failed());
   }
-  reset(); void *p = graph_malloc(12, 0, nullptr); REQUIRE(p);
+  reset(); void *p = graph_backup_malloc(12, 0, nullptr); REQUIRE(p);
   ok(saver_pause("acl_graph")); fake_acl::fail_next("aclrtFreeHost");
   REQUIRE(saver_release(p) != 0);
   REQUIRE(fake_acl::live_host() == 1 && fake_acl::live_reservations() == 1);
@@ -196,18 +206,18 @@ void free_failure_matrix() {
 
 void guards_and_partial_batch() {
   reset();
-  REQUIRE(weights_malloc(std::numeric_limits<size_t>::max(), 0, nullptr) == nullptr);
+  REQUIRE(weights_backup_malloc(std::numeric_limits<size_t>::max(), 0, nullptr) == nullptr);
   REQUIRE(fake_acl::live_reservations() == 0);
   REQUIRE(saver_pause("unknown") != 0);
   ok(saver_pause("kv_cache"));
   REQUIRE(kv_malloc(10, 0, nullptr) == nullptr); // Empty paused tag also rejects alloc.
   ok(saver_resume("kv_cache"));
   void *w = weights_discard_malloc(12, 0, nullptr); REQUIRE(w);
-  void *g = graph_malloc(12, 0, nullptr); REQUIRE(g); pattern(g, 12, 0x31);
+  void *g = graph_backup_malloc(12, 0, nullptr); REQUIRE(g); pattern(g, 12, 0x31);
   fake_acl::set_device(1);
   REQUIRE(saver_pause(nullptr) != 0);
   REQUIRE(stat_has("\"active_segments\":2"));
-  REQUIRE(weights_malloc(12, 1, nullptr) == nullptr);
+  REQUIRE(weights_backup_malloc(12, 1, nullptr) == nullptr);
   fake_acl::set_device(0);
   int alternate_context = 0;
   fake_acl::set_context(&alternate_context); // Same device, different context.
@@ -216,7 +226,7 @@ void guards_and_partial_batch() {
   REQUIRE(saver_resume(nullptr) != 0);
   REQUIRE(saver_release(w) != 0);
   REQUIRE(saver_collect_failed() != 0);
-  REQUIRE(weights_malloc(12, 0, nullptr) == nullptr);
+  REQUIRE(weights_backup_malloc(12, 0, nullptr) == nullptr);
   REQUIRE(fake_acl::calls("aclrtUnmapMem") == unmaps);
   REQUIRE(stat_has("\"active_segments\":2"));
   fake_acl::set_context(nullptr);
@@ -241,7 +251,7 @@ void callback_fault_is_terminal() {
   REQUIRE(stat_has("\"callback_fault\":true"));
   REQUIRE(stat_has("\"callback_error\":\"aclrtSynchronizeDevice before final free failed"));
   REQUIRE(fake_acl::calls("aclrtUnmapMem") == 0);
-  REQUIRE(weights_malloc(12, 0, nullptr) == nullptr);
+  REQUIRE(weights_backup_malloc(12, 0, nullptr) == nullptr);
   REQUIRE(saver_pause(nullptr) != 0);
   REQUIRE(saver_resume(nullptr) != 0);
   ok(saver_collect_failed()); // Cleanup is allowed, but cannot reopen a worker.
@@ -255,7 +265,7 @@ void callback_fault_is_terminal() {
 void callback_retires_before_validation(bool wrong_context) {
   reset();
   constexpr size_t size = 17;
-  void *p = graph_malloc(size, 0, nullptr);
+  void *p = graph_backup_malloc(size, 0, nullptr);
   REQUIRE(p);
   if (!wrong_context) {
     ok(saver_pause("acl_graph"));
@@ -290,7 +300,7 @@ void callback_retires_before_validation(bool wrong_context) {
   REQUIRE(std::string(saver_last_error()) == "unknown or already freed pointer");
   REQUIRE(stat_has("\"callback_error\":\"" + first_error + "\""));
   REQUIRE(saver_has_callback_fault() == 1);
-  REQUIRE(weights_malloc(size, 0, nullptr) == nullptr);
+  REQUIRE(weights_backup_malloc(size, 0, nullptr) == nullptr);
   REQUIRE(saver_pause(nullptr) != 0);
   REQUIRE(saver_resume(nullptr) != 0);
 }
@@ -310,7 +320,7 @@ int main(int argc, char **argv) {
       return 0;
     }
     REQUIRE(argc == 1);
-    backup_roundtrip();
+    policy_roundtrips();
     default_policies_tags_and_paused_free();
     pause_failure_matrix();
     resume_failure_matrix();

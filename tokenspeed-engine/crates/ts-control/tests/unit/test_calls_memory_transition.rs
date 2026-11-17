@@ -20,26 +20,26 @@
 
 #[test]
 fn memory_operations_preserve_transition_ids_and_allow_legacy_calls() {
-    let ControlRequest::ReleaseMemoryOccupation(release) = rl(
-        "release_memory_occupation",
-        vec![body(vec![
-            ("tags", Value::Array(vec!["kv_cache".into()])),
-            ("transition_id", "training-step-42-release".into()),
-        ])],
-    )
-    .unwrap() else {
-        panic!("a release");
-    };
-    assert_eq!(release.tags, Some(vec!["kv_cache".to_owned()]));
-    assert_eq!(
-        release.rid,
-        Some(StrOrList::One("training-step-42-release".to_owned()))
-    );
-    let ControlRequest::ResumeMemoryOccupation(resume) =
-        rl("resume_memory_occupation", Vec::new()).unwrap()
-    else {
-        panic!("a resume");
-    };
-    assert_eq!(resume.tags, None);
-    assert_eq!(resume.rid, None);
+    for method in ["release_memory_occupation", "resume_memory_occupation"] {
+        for supplied in [false, true] {
+            let args = if supplied {
+                vec![body(vec![
+                    ("tags", Value::Array(vec!["kv_cache".into()])),
+                    ("transition_id", "training-step-42".into()),
+                ])]
+            } else {
+                Vec::new()
+            };
+            let (tags, rid) = match rl(method, args).unwrap() {
+                ControlRequest::ReleaseMemoryOccupation(request) => (request.tags, request.rid),
+                ControlRequest::ResumeMemoryOccupation(request) => (request.tags, request.rid),
+                _ => panic!("a memory operation"),
+            };
+            assert_eq!(tags, supplied.then(|| vec!["kv_cache".to_owned()]));
+            assert_eq!(
+                rid,
+                supplied.then(|| StrOrList::One("training-step-42".to_owned()))
+            );
+        }
+    }
 }

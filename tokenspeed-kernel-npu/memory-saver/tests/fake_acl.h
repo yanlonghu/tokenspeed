@@ -55,18 +55,14 @@ aclError aclrtSynchronizeDevice(void);
 }
 
 #include <string>
-#include <vector>
 namespace fake_acl {
 void reset(); // Requires all fake allocations already freed.
 void fail_next(const std::string &api);
-void clear_failures();
 void set_device(int device);
 void set_context(aclrtContext context);
 size_t live_reservations();
 size_t live_physical();
 size_t live_host();
 size_t calls(const std::string &api);
-std::vector<std::string> trace();
-size_t granularity();
 }
 #endif

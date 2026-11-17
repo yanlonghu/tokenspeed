@@ -18,169 +18,169 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+fn wake_regions(tags: Option<Vec<String>>) -> ControlRequest {
+    ControlRequest::ResumeMemoryOccupation(ts_wire::control::ResumeMemoryOccupationReqInput {
+        rid: None,
+        http_worker_ipc: None,
+        tags,
+    })
+}
+
 #[test]
-fn omitted_memory_tags_use_only_the_engines_regions_in_lifecycle_order() {
-    for expected in [
+fn configured_memory_regions_normalize_and_round_trip_in_lifecycle_order() {
+    for regions in [
         &["kv_cache", "weights", "acl_graph"][..],
         &["kv_cache", "weights", "cuda_graph"][..],
         &["kv_cache", "weights", "cuda_graph", "nccl"][..],
     ] {
-        let mut controls = controls(true);
-        controls.config.memory_regions =
-            expected.iter().rev().map(|tag| (*tag).to_owned()).collect();
-
-        let released = controls.release_tags(None, None).unwrap();
-        assert_eq!(released, expected);
-        controls.finish_release(released);
-
-        let resumed = controls.resume_tags(None).unwrap();
-        let expected_resume: Vec<_> = expected.iter().rev().copied().collect();
-        assert_eq!(resumed, expected_resume);
-        controls.finish_resume(&resumed);
-        assert!(!controls.memory_released());
-    }
-}
-
-#[test]
-fn memory_operations_accept_and_order_the_configured_graph_tag() {
-    for (release_order, unavailable) in [
-        (&["kv_cache", "weights", "acl_graph"][..], "cuda_graph"),
-        (
-            &["kv_cache", "weights", "cuda_graph", "nccl"][..],
-            "acl_graph",
-        ),
-    ] {
-        let mut controls = controls(true);
-        controls.config.memory_regions = release_order
-            .iter()
-            .rev()
-            .map(|tag| (*tag).to_owned())
-            .collect();
-        controls.handle(release(Some(vec![unavailable])), None);
-        assert!(controls.drain().is_none());
-        assert_eq!(
-            successes(&controls.take_replies()),
-            [("ReleaseMemoryOccupationReqOutput", false)]
-        );
-
-        let mut requested: Vec<_> = release_order.iter().rev().copied().collect();
-        requested.push("weights");
-        controls.handle(release(Some(requested)), None);
-        let Some(Drain::Release(tags)) = controls.take_drain() else {
-            panic!("the configured regions drain");
-        };
-        assert_eq!(
-            tags.iter().map(String::as_str).collect::<Vec<_>>(),
-            release_order
-        );
-        controls.finish_release(tags);
-        assert_eq!(
-            successes(&controls.take_replies()),
-            [("ReleaseMemoryOccupationReqOutput", true)]
-        );
-
-        let resume_memory = |tags| {
-            ControlRequest::ResumeMemoryOccupation(
-                ts_wire::control::ResumeMemoryOccupationReqInput {
-                    rid: None,
-                    http_worker_ipc: None,
-                    tags,
-                },
-            )
-        };
-        assert!(matches!(
-            controls.handle(resume_memory(Some(vec![unavailable.to_owned()])), None),
-            Effect::None
-        ));
-        assert_eq!(
-            successes(&controls.take_replies()),
-            [("ResumeMemoryOccupationReqOutput", false)]
-        );
-        let effect = controls.handle(
-            resume_memory(Some(
-                release_order.iter().map(|tag| (*tag).to_owned()).collect(),
-            )),
-            None,
-        );
-        let tags = if release_order.contains(&"nccl") {
-            // NCCL wake must wait for the operation gate before device collectives.
-            assert!(matches!(effect, Effect::None));
-            assert!(controls.take_replies().is_empty());
-            let Some(ControlRequest::ResumeMemoryOccupation(resume)) = controls.pop_weight_op()
-            else {
-                panic!("the NCCL resume is queued for the operation gate");
-            };
-            assert!(controls.weight_head().is_none());
-            resume.tags.expect("the queued resume has normalized tags")
-        } else {
-            let Effect::ResumeMemory(tags) = effect else {
-                panic!("ordinary regions resume locally");
-            };
-            tags
-        };
-        let resume_order: Vec<_> = release_order.iter().rev().copied().collect();
-        assert_eq!(
-            tags.iter().map(String::as_str).collect::<Vec<_>>(),
-            resume_order
-        );
-        controls.finish_resume(&tags);
-        assert_eq!(
-            successes(&controls.take_replies()),
-            [("ResumeMemoryOccupationReqOutput", true)]
-        );
-    }
-}
-
-#[test]
-fn ascend_graph_release_includes_kv_once_in_release_order() {
-    for coordinated in [false, true] {
-        for (requested, expected) in [
-            (&["acl_graph"][..], &["kv_cache", "acl_graph"][..]),
-            (
-                &["acl_graph", "acl_graph"][..],
-                &["kv_cache", "acl_graph"][..],
-            ),
-            (
-                &["acl_graph", "weights"][..],
-                &["kv_cache", "weights", "acl_graph"][..],
-            ),
-            (
-                &["acl_graph", "kv_cache", "weights", "kv_cache"][..],
-                &["kv_cache", "weights", "acl_graph"][..],
-            ),
-        ] {
+        for omitted in [false, true] {
             let mut controls = controls(true);
-            controls.config.replica_memory_transitions = coordinated;
-            controls.config.memory_regions.push("acl_graph".to_owned());
-
-            controls.handle(release(Some(requested.to_vec())), None);
+            controls.config.memory_regions =
+                regions.iter().rev().map(|tag| (*tag).to_owned()).collect();
+            let requested = (!omitted).then(|| {
+                let mut tags: Vec<_> = regions.iter().rev().copied().collect();
+                tags.push("weights");
+                tags
+            });
+            controls.handle(release(requested), None);
             let Some(Drain::Release(tags)) = controls.take_drain() else {
-                panic!("Ascend graph sleep drains its KV arena");
+                panic!("configured regions drain");
             };
-            assert_eq!(tags, expected);
+            assert_eq!(tags, regions);
             assert!(controls.take_replies().is_empty());
             controls.finish_release(tags);
             assert_eq!(
                 successes(&controls.take_replies()),
                 [("ReleaseMemoryOccupationReqOutput", true)]
             );
+            let expected: Vec<_> = regions.iter().rev().copied().collect();
+            let requested =
+                (!omitted).then(|| regions.iter().map(|tag| (*tag).to_owned()).collect());
+            let effect = controls.handle(wake_regions(requested), None);
+            let tags = if regions.contains(&"nccl") {
+                assert!(matches!(effect, Effect::None));
+                assert!(controls.take_replies().is_empty());
+                let Some(ControlRequest::ResumeMemoryOccupation(resume)) = controls.pop_weight_op()
+                else {
+                    panic!("NCCL wake waits for the operation gate");
+                };
+                assert!(controls.weight_head().is_none());
+                resume.tags.unwrap()
+            } else {
+                let Effect::ResumeMemory(tags) = effect else {
+                    panic!("regions resume");
+                };
+                tags
+            };
+            assert_eq!(tags, expected);
+            controls.finish_resume(&tags);
+            assert!(!controls.memory_released());
+            assert_eq!(
+                successes(&controls.take_replies()),
+                [("ResumeMemoryOccupationReqOutput", true)]
+            );
         }
     }
 }
 
 #[test]
-fn ascend_graph_wake_keeps_kv_asleep_until_explicit_wake() {
-    for (coordinated, kv_released_first) in
-        [(false, false), (false, true), (true, false), (true, true)]
-    {
+fn memory_tag_refusals_use_the_backend_tag_set_and_configured_regions() {
+    for (graph, unavailable) in [("acl_graph", "cuda_graph"), ("cuda_graph", "acl_graph")] {
+        let mut controls = controls(true);
+        controls.config.memory_regions.push(graph.to_owned());
+        // Unknown, known-on-another-backend, and known-but-unavailable tags
+        // must all refuse without starting a drain or changing sleeping state.
+        for tag in ["unknown", unavailable, "nccl"] {
+            for releasing in [true, false] {
+                let request = if releasing {
+                    release(Some(vec![tag]))
+                } else {
+                    wake_regions(Some(vec![tag.to_owned()]))
+                };
+                controls.handle(request, None);
+                let replies = controls.take_replies();
+                let (success, message) = match replies.as_slice() {
+                    [ControlOutput::ReleaseMemoryOccupation(reply)] => {
+                        (reply.success, &reply.message)
+                    }
+                    [ControlOutput::ResumeMemoryOccupation(reply)] => {
+                        (reply.success, &reply.message)
+                    }
+                    _ => panic!("one refused reply"),
+                };
+                assert!(!success);
+                assert!(message.contains(tag));
+                assert!(message.contains(graph), "backend regions: {message}");
+                if tag == "unknown" {
+                    assert!(
+                        !message.contains(unavailable),
+                        "backend tag universe: {message}"
+                    );
+                }
+                if tag != "nccl" || graph == "acl_graph" {
+                    assert!(message.starts_with("invalid tags:"));
+                } else {
+                    assert!(message.contains("not releasable"));
+                }
+                assert!(controls.drain().is_none());
+                assert!(!controls.memory_released());
+            }
+        }
+    }
+}
+
+#[test]
+fn ascend_graph_release_includes_kv_once_in_release_order() {
+    for (coordinated, requested, expected) in [
+        (false, &["acl_graph"][..], &["kv_cache", "acl_graph"][..]),
+        (
+            true,
+            &["acl_graph", "acl_graph"][..],
+            &["kv_cache", "acl_graph"][..],
+        ),
+        (
+            false,
+            &["acl_graph", "weights"][..],
+            &["kv_cache", "weights", "acl_graph"][..],
+        ),
+        (
+            true,
+            &["acl_graph", "weights", "kv_cache", "kv_cache"][..],
+            &["kv_cache", "weights", "acl_graph"][..],
+        ),
+    ] {
         let mut controls = controls(true);
         controls.config.replica_memory_transitions = coordinated;
         controls.config.memory_regions.push("acl_graph".to_owned());
+        controls.handle(release(Some(requested.to_vec())), None);
+        let Some(Drain::Release(tags)) = controls.take_drain() else {
+            panic!("graph sleep drains KV");
+        };
+        assert_eq!(tags, expected);
+        assert!(controls.take_replies().is_empty());
+        controls.finish_release(tags);
+        assert_eq!(
+            successes(&controls.take_replies()),
+            [("ReleaseMemoryOccupationReqOutput", true)]
+        );
+    }
+}
 
-        if kv_released_first {
+#[test]
+fn graph_wake_preserves_the_backend_kv_sleeping_state() {
+    for (graph, coordinated, kv_first) in [
+        ("acl_graph", false, false),
+        ("acl_graph", true, true),
+        ("cuda_graph", false, false),
+        ("cuda_graph", true, false),
+    ] {
+        let mut controls = controls(true);
+        controls.config.replica_memory_transitions = coordinated;
+        controls.config.memory_regions.push(graph.to_owned());
+        if kv_first {
             controls.handle(release(Some(vec!["kv_cache"])), None);
             let Some(Drain::Release(tags)) = controls.take_drain() else {
-                panic!("the KV arena drains");
+                panic!("KV drains");
             };
             assert_eq!(tags, ["kv_cache"]);
             controls.finish_release(tags);
@@ -189,125 +189,40 @@ fn ascend_graph_wake_keeps_kv_asleep_until_explicit_wake() {
                 [("ReleaseMemoryOccupationReqOutput", true)]
             );
         }
-
-        controls.handle(release(Some(vec!["acl_graph"])), None);
+        controls.handle(release(Some(vec![graph])), None);
         let Some(Drain::Release(tags)) = controls.take_drain() else {
-            panic!("graph sleep drains every resident region it requires");
+            panic!("graph drains");
         };
-        let expected = if kv_released_first {
-            &["acl_graph"][..]
+        let expected = if graph == "acl_graph" && !kv_first {
+            vec!["kv_cache", graph]
         } else {
-            &["kv_cache", "acl_graph"][..]
+            vec![graph]
         };
         assert_eq!(tags, expected);
         controls.finish_release(tags);
-
-        for tag in ["acl_graph", "kv_cache"] {
-            let wake = ControlRequest::ResumeMemoryOccupation(
-                ts_wire::control::ResumeMemoryOccupationReqInput {
-                    rid: None,
-                    http_worker_ipc: None,
-                    tags: Some(vec![tag.to_owned()]),
-                },
-            );
-            let Effect::ResumeMemory(tags) = controls.handle(wake, None) else {
-                panic!("the requested region resumes");
+        assert_eq!(
+            successes(&controls.take_replies()),
+            [("ReleaseMemoryOccupationReqOutput", true)]
+        );
+        for tag in if graph == "acl_graph" {
+            vec![graph, "kv_cache"]
+        } else {
+            vec![graph]
+        } {
+            let Effect::ResumeMemory(tags) =
+                controls.handle(wake_regions(Some(vec![tag.to_owned()])), None)
+            else {
+                panic!("requested region resumes");
             };
             assert_eq!(tags, [tag]);
             controls.finish_resume(&tags);
-            assert_eq!(controls.memory_released(), tag == "acl_graph");
-            assert_eq!(controls.forward_blocked(), tag == "acl_graph");
+            let kv_asleep = graph == "acl_graph" && tag == graph;
+            assert_eq!(controls.memory_released(), kv_asleep);
+            assert_eq!(controls.forward_blocked(), kv_asleep);
+            assert_eq!(
+                successes(&controls.take_replies()),
+                [("ResumeMemoryOccupationReqOutput", true)]
+            );
         }
-        assert_eq!(
-            successes(&controls.take_replies()),
-            [
-                ("ReleaseMemoryOccupationReqOutput", true),
-                ("ResumeMemoryOccupationReqOutput", true),
-                ("ResumeMemoryOccupationReqOutput", true),
-            ]
-        );
     }
-}
-
-#[test]
-fn gpu_graph_only_release_and_resume_leave_kv_resident() {
-    for coordinated in [false, true] {
-        let mut controls = controls(true);
-        controls.config.replica_memory_transitions = coordinated;
-        controls.config.memory_regions.push("cuda_graph".to_owned());
-
-        controls.handle(release(Some(vec!["cuda_graph"])), None);
-        let Some(Drain::Release(tags)) = controls.take_drain() else {
-            panic!("the CUDA-compatible graph pool drains");
-        };
-        assert_eq!(tags, ["cuda_graph"]);
-        controls.finish_release(tags);
-        let wake = ControlRequest::ResumeMemoryOccupation(
-            ts_wire::control::ResumeMemoryOccupationReqInput {
-                rid: None,
-                http_worker_ipc: None,
-                tags: Some(vec!["cuda_graph".to_owned()]),
-            },
-        );
-        let Effect::ResumeMemory(tags) = controls.handle(wake, None) else {
-            panic!("the CUDA-compatible graph pool resumes");
-        };
-        assert_eq!(tags, ["cuda_graph"]);
-        controls.finish_resume(&tags);
-        assert!(!controls.memory_released());
-        assert!(!controls.forward_blocked());
-        assert_eq!(
-            successes(&controls.take_replies()),
-            [
-                ("ReleaseMemoryOccupationReqOutput", true),
-                ("ResumeMemoryOccupationReqOutput", true),
-            ]
-        );
-    }
-}
-
-#[test]
-fn gpu_memory_tag_errors_use_the_cuda_tag_set() {
-    let mut controls = controls(true);
-    controls.config.memory_regions.push("cuda_graph".to_owned());
-
-    controls.handle(release(Some(vec!["unknown"])), None);
-    let replies = controls.take_replies();
-    let [ControlOutput::ReleaseMemoryOccupation(reply)] = replies.as_slice() else {
-        panic!("the release is refused");
-    };
-    assert!(!reply.success);
-    assert_eq!(
-        reply.message,
-        r#"invalid tags: ["unknown"]; valid: ["kv_cache", "weights", "cuda_graph", "nccl"]"#
-    );
-
-    let wake =
-        ControlRequest::ResumeMemoryOccupation(ts_wire::control::ResumeMemoryOccupationReqInput {
-            rid: None,
-            http_worker_ipc: None,
-            tags: Some(vec!["acl_graph".to_owned()]),
-        });
-    controls.handle(wake, None);
-    let replies = controls.take_replies();
-    let [ControlOutput::ResumeMemoryOccupation(reply)] = replies.as_slice() else {
-        panic!("the wake is refused");
-    };
-    assert!(!reply.success);
-    assert_eq!(
-        reply.message,
-        r#"invalid tags: ["acl_graph"]; valid: ["kv_cache", "weights", "cuda_graph", "nccl"]"#
-    );
-
-    controls.handle(release(Some(vec!["nccl"])), None);
-    let replies = controls.take_replies();
-    let [ControlOutput::ReleaseMemoryOccupation(reply)] = replies.as_slice() else {
-        panic!("the release is refused");
-    };
-    assert!(!reply.success);
-    assert_eq!(
-        reply.message,
-        r#"tags not releasable on this engine: ["nccl"]; available: ["kv_cache", "weights", "cuda_graph"]"#
-    );
-    assert!(controls.drain().is_none());
 }

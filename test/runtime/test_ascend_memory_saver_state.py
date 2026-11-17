@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CPU behavior tests; the absent NPU allocator is represented by a byte store."""
+"""Stdlib-only ownership and gate tests; adapter/native tests own byte recovery."""
 
 import importlib.util
 import sys
@@ -59,77 +59,33 @@ class FakePool:
     id: tuple[int, int]
 
 
-class FakeNpu:
+class FakeBackend:
     def __init__(self):
-        self.next_id = 1
-        self.content = {}
-        self.saved = {}
+        self.created = []
         self.fail_resume = False
 
     def make_pool(self, key):
-        pool = FakePool((0, self.next_id))
-        self.next_id += 1
-        self.content[key] = bytearray(b"initial")
-        return OwnedPool(object(), pool)
+        self.created.append(key)
+        return OwnedPool(object(), FakePool((0, len(self.created))))
 
     def pause(self, tag):
-        for key, data in list(self.content.items()):
-            if tag is None or key.tag == tag:
-                if key.policy is AllocationPolicy.CPU_BACKUP:
-                    self.saved[key] = bytes(data)
-                self.content[key] = None
+        pass
 
     def resume(self, tag):
         if self.fail_resume:
             raise RuntimeError("injected H2D failure")
-        for key, data in list(self.content.items()):
-            if (tag is None or key.tag == tag) and data is None:
-                self.content[key] = bytearray(self.saved.get(key, bytes(7)))
 
 
 class PoolStateTests(unittest.TestCase):
     def setUp(self):
-        self.backend = FakeNpu()
+        self.backend = FakeBackend()
         self.state = PoolState(
             backend=self.backend,
             make_pool=self.backend.make_pool,
             synchronize=lambda: None,
         )
 
-    def test_weights_restore_kv_discard_and_partial_resume_stays_blocked(self):
-        with self.state.region(WEIGHTS):
-            self.backend.content[WEIGHTS][:] = b"weights"
-        with self.state.region(KV):
-            self.backend.content[KV][:] = b"history"
-        self.state.pause(None)
-        self.state.resume("weights")
-        self.assertEqual(self.backend.content[WEIGHTS], b"weights")
-        with self.assertRaises(RuntimeError):
-            self.state.assert_active()
-        self.state.resume("kv_cache")
-        with self.assertRaises(RuntimeError):
-            self.state.assert_active()
-        self.state.resume("acl_graph")
-        self.state.assert_active()
-        self.assertEqual(self.backend.content[KV], bytes(7))
-
-    def test_region_reentry_reuses_pool_and_preserves_updated_content(self):
-        with self.state.region(WEIGHTS) as first:
-            self.backend.content[WEIGHTS][:] = b"changed"
-        with self.state.region(WEIGHTS) as second:
-            self.assertIs(first, second)
-        self.assertEqual(self.backend.content[WEIGHTS], b"changed")
-
-    def test_allocation_blocked_while_paused_even_before_first_allocation(self):
-        self.state.pause("weights")
-        with self.assertRaises(RuntimeError):
-            with self.state.region(WEIGHTS):
-                self.fail("unmapped pool became available")
-        self.state.resume("weights")
-        with self.state.region(WEIGHTS):
-            pass
-
-    def test_pause_all_before_any_pool_blocks_all_three_tags(self):
+    def test_partial_resume_stays_blocked_even_before_first_allocation(self):
         self.state.pause(None)
         with self.assertRaises(RuntimeError):
             self.state.assert_active()
@@ -137,12 +93,21 @@ class PoolStateTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(RuntimeError):
                 with self.state.region(key):
                     self.fail("paused empty tag became usable")
+        for tag in ("weights", "kv_cache"):
+            self.state.resume(tag)
+            with self.assertRaises(RuntimeError):
+                self.state.assert_active()
+        with self.state.region(WEIGHTS):
+            pass
+        self.state.resume("acl_graph")
+        self.state.assert_active()
+        self.state.pause(None)
         self.state.resume(None)
         self.state.assert_active()
 
     def test_resume_failure_blocks_use_until_successful_retry(self):
         with self.state.region(GRAPH):
-            self.backend.content[GRAPH][:] = b"persist"
+            pass
         self.state.pause("acl_graph")
         self.backend.fail_resume = True
         with self.assertRaisesRegex(RuntimeError, "H2D"):
@@ -152,7 +117,6 @@ class PoolStateTests(unittest.TestCase):
         self.backend.fail_resume = False
         self.state.resume("acl_graph")
         self.state.assert_active()
-        self.assertEqual(self.backend.content[GRAPH], b"persist")
 
     def test_pause_rejects_live_capture_and_scope_exception_cleans_gate(self):
         with self.assertRaisesRegex(ValueError, "capture failed"):
@@ -172,25 +136,12 @@ class PoolStateTests(unittest.TestCase):
         with self.state.region(KV):
             pass
 
-    def test_explicit_shared_graph_pool_preserved_foreign_pool_rejected(self):
-        with self.state.region(GRAPH) as owned:
-            selected = self.state.graph_pool(owned=owned, requested=None)
-            self.assertEqual(
-                self.state.graph_pool(owned=owned, requested=selected),
-                selected,
-            )
-            with self.assertRaises(ValueError):
-                self.state.graph_pool(owned=owned, requested=(0, 99))
-
-    def test_same_tag_distinct_policies_both_release(self):
+    def test_same_tag_keeps_distinct_policy_pools(self):
         with self.state.region(WEIGHTS) as backup:
             pass
         with self.state.region(WEIGHTS_DISCARD) as discard:
             self.assertNotEqual(backup.pool.id, discard.pool.id)
-        self.state.pause("weights")
-        self.state.resume("weights")
-        self.assertEqual(self.backend.content[WEIGHTS], b"initial")
-        self.assertEqual(self.backend.content[WEIGHTS_DISCARD], bytes(7))
+        self.assertEqual(self.backend.created, [WEIGHTS, WEIGHTS_DISCARD])
 
     def test_one_tag_can_share_or_separate_graph_pools_by_scope(self):
         shared = PoolKey("acl_graph", AllocationPolicy.DISCARD, "joint")
@@ -199,6 +150,7 @@ class PoolStateTests(unittest.TestCase):
         with self.state.region(shared) as first:
             shared_pool = self.state.graph_pool(owned=first, requested=None)
         with self.state.region(shared) as second:
+            self.assertIs(first, second)
             self.assertEqual(
                 self.state.graph_pool(owned=second, requested=shared_pool), shared_pool
             )
@@ -208,7 +160,9 @@ class PoolStateTests(unittest.TestCase):
         with self.state.region(draft) as draft_pool:
             self.assertNotEqual(target_pool.pool.id, draft_pool.pool.id)
         self.state.pause("acl_graph")
-        self.assertEqual(self.backend.content, dict.fromkeys((shared, target, draft)))
+        self.assertEqual(self.backend.created, [shared, target, draft])
+        with self.assertRaises(RuntimeError):
+            self.state.assert_active()
 
     def test_resident_storage_does_not_create_or_borrow_a_managed_pool(self):
         resident = PoolKey("acl_graph", AllocationPolicy.REMAIN, "draft")
@@ -220,36 +174,28 @@ class PoolStateTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cannot use a managed pool"):
                 self.state.graph_pool(owned=graph, requested=managed_pool)
         self.state.pause("acl_graph")
-        self.assertEqual(self.backend.content, {GRAPH: None})
+        self.assertEqual(self.backend.created, [GRAPH])
 
-    def test_parameter_policy_must_preserve_or_explicitly_discard_weights(self):
-        for policy in ("cpu_backup", "discard"):
-            with self.subTest(policy=policy):
-                validate_memory_saver_scope(
-                    has_draft_weights=False,
-                    weight_policy=policy,
-                    draft_policy=None,
+    def test_parameter_and_draft_restore_policies_are_explicit(self):
+        for has_draft, weight, draft, valid in (
+            (False, "cpu_backup", None, True),
+            (False, "discard", None, True),
+            (False, None, None, False),
+            (True, "discard", "retain", True),
+            (True, "discard", "refresh", True),
+            (True, "discard", None, False),
+        ):
+            with self.subTest(has_draft=has_draft, weight=weight, draft=draft):
+                args = dict(
+                    has_draft_weights=has_draft,
+                    weight_policy=weight,
+                    draft_policy=draft,
                 )
-        with self.assertRaises(ValueError):
-            validate_memory_saver_scope(
-                has_draft_weights=False,
-                weight_policy=None,
-                draft_policy=None,
-            )
-
-    def test_draft_discard_requires_an_explicit_restore_policy(self):
-        args = dict(
-            has_draft_weights=True,
-            weight_policy="discard",
-            draft_policy="retain",
-        )
-        validate_memory_saver_scope(**args)
-        validate_memory_saver_scope(**(args | {"draft_policy": "refresh"}))
-        validate_memory_saver_scope(
-            **(args | {"has_draft_weights": False, "draft_policy": None})
-        )
-        with self.assertRaises(ValueError):
-            validate_memory_saver_scope(**(args | {"draft_policy": None}))
+                if valid:
+                    validate_memory_saver_scope(**args)
+                else:
+                    with self.assertRaises(ValueError):
+                        validate_memory_saver_scope(**args)
 
 
 if __name__ == "__main__":

@@ -41,6 +41,17 @@ class CpuMemorySaver:
         self.cpu_backup = False
         self.allocations = allocations
         self.snapshots = {}
+        self.nccl_resident = True
+        self.pending_work = False
+
+    def synchronize(self):
+        self.pending_work = False
+
+    def suspend_nccl(self):
+        self.nccl_resident = False
+
+    def resume_nccl(self):
+        self.nccl_resident = True
 
     @contextmanager
     def region(self, *, tag, enable_cpu_backup):
@@ -73,6 +84,7 @@ class CpuMemorySaver:
         return tensor
 
     def pause(self, *, tag):
+        assert not self.pending_work, "unmapped storage before pending work completed"
         for allocation_tag, tensor, cpu_backup in self.allocations:
             if allocation_tag == tag:
                 if cpu_backup:
@@ -182,13 +194,6 @@ def test_enabled_gpu_saver_refuses_a_cpu_torch_build(monkeypatch):
         adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
 
 
-def test_cpu_torch_refuses_an_enabled_gpu_allocator(monkeypatch):
-    monkeypatch.setattr(torch.version, "cuda", None)
-    monkeypatch.setattr(torch.version, "hip", None)
-    with pytest.raises(RuntimeError, match="CUDA or ROCm PyTorch build"):
-        adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
-
-
 def test_npu_and_disabled_gpu_can_construct_adapters_without_gpu_package(monkeypatch):
     monkeypatch.setitem(sys.modules, "torch_memory_saver", None)
     adapter.TorchMemorySaverAdapter.create(enable=True, device="npu")
@@ -259,18 +264,31 @@ def test_unknown_named_region_is_rejected(memory, enabled):
             pytest.fail("unknown region entered its allocation scope")
 
 
-@pytest.mark.parametrize(
-    "adapter_class",
-    [adapter._TorchMemorySaverAdapterNoop, adapter._TorchMemorySaverAdapterReal],
-)
-def test_default_allocator_keeps_memory_protocol_v2(adapter_class):
-    from tokenspeed.runtime.engine.memory_protocol import (
-        supports_replica_memory_transitions,
-    )
+@pytest.mark.parametrize("nccl_suspendable", [False, True])
+def test_gpu_graph_region_routes_to_its_pool(memory, nccl_suspendable):
+    from tokenspeed.runtime.engine.memory_occupation import memory_regions
 
-    assert not supports_replica_memory_transitions(
-        checked_startup=True,
-        memory_saver=True,
-        backend_capable=adapter_class.supports_replica_memory_transitions,
-        role="null",
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
+    with saver.region(tag="weights", enable_cpu_backup=False):
+        weight = memory.allocate(5)
+    with saver.region(tag="cuda_graph", enable_cpu_backup=False):
+        scratch = memory.allocate(7)
+    regions = memory_regions(
+        memory,
+        saver,
+        graph_tag="cuda_graph",
+        nccl_suspendable=nccl_suspendable,
+        synchronize_kv_before_registration=False,
     )
+    assert list(regions) == ["kv_cache", "weights", "cuda_graph"] + (
+        ["nccl"] if nccl_suspendable else []
+    )
+    memory.pending_work = True
+    regions["cuda_graph"].release()
+    regions["cuda_graph"].resume()
+    assert (weight.item(), scratch.item()) == (5, 0)
+    if nccl_suspendable:
+        regions["nccl"].release()
+        assert not memory.nccl_resident
+        regions["nccl"].resume()
+        assert memory.nccl_resident
