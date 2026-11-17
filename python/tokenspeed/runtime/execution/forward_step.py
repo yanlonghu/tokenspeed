@@ -864,14 +864,14 @@ class ForwardStepRunner:
                 AllocationPolicy,
             )
 
-            # Preserve private-pool bytes: capture may retain state that replay
-            # does not rewrite before reading. The executable stays resident.
+            # Keep persistent state outside this pool; replay must write its
+            # temporaries before reading them. The executable stays resident.
             graph_capture = self.memory_saver_adapter.npu_graph(
                 graph,
                 pool=global_graph_memory_pool,
                 stream=self.stream,
                 tag="acl_graph",
-                policy=AllocationPolicy.CPU_BACKUP,
+                policy=AllocationPolicy.DISCARD,
                 pool_scope="decode",
                 auto_dispatch_capture=True,
             )
